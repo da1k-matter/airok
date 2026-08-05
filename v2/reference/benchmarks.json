@@ -1,0 +1,12 @@
+{
+  "note": "Historical research checkpoints. They are not hard verification targets because library/runtime versions and retraining randomness can move the path.",
+  "lightgbm_legacy_best_v2": {
+    "setup": "single seed 42, horizons 7+10, original causal BTC-vol overlay",
+    "full_oos": {"sharpe": 2.1988, "cagr": 0.5445, "max_dd": 0.1385, "positive_months": 32, "n_months": 37},
+    "latest_year": {"sharpe": 2.3590, "cagr": 0.7591, "max_dd": 0.1385, "positive_months": 11, "n_months": 13}
+  },
+  "full_budget_multiseed_7_10": {
+    "catboost_yetirank_ndcg": {"full_sharpe": 1.50, "full_cagr": 0.344, "positive_months": 26, "n_months": 37},
+    "lightgbm_lambdarank": {"full_sharpe": 1.28, "full_cagr": 0.246, "positive_months": 25, "n_months": 37}
+  }
+}

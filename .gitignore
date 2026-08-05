@@ -1,0 +1,20 @@
+# macOS metadata
+.DS_Store
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.venv/
+venv/
+
+# Local datasets and generated research artifacts
+**/data/
+**/outputs/
+*.html
+
+# Local archives
+*.tar.zst

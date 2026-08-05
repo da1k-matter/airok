@@ -1,0 +1,5 @@
+{
+  "full": {"cagr": 0.4085, "sharpe": 1.72, "max_dd": 0.1537, "positive_months": 26, "n_months": 37, "turnover_pa": 62.7},
+  "latest_year": {"cagr": 0.4865, "sharpe": 1.75, "max_dd": 0.0973, "positive_months": 9, "n_months": 13, "turnover_pa": 58.4},
+  "tolerance": {"cagr": 0.01, "sharpe": 0.08, "max_dd": 0.015, "turnover_pa": 2.0}
+}

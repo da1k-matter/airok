@@ -1,0 +1,26 @@
+ranktrend/
+├── README.md
+├── pyproject.toml
+├── run.sh
+├── configs/
+│   ├── best_v2.yaml
+│   └── baseline_h7.yaml
+├── data/1d/                    # 686 Bybit daily-bar CSV files
+├── src/ranktrend/
+│   ├── __main__.py
+│   ├── cli.py
+│   ├── config.py
+│   ├── data.py
+│   ├── research.py
+│   ├── portfolio.py
+│   ├── reporting.py
+│   └── pipeline.py
+├── tests/
+│   ├── test_config.py
+│   └── test_core.py
+├── reference/
+│   ├── expected_best_v2.json
+│   ├── expected_baseline_h7.json
+│   └── packaged_build/
+├── .cache/predictions/        # small pre-trained score caches
+└── outputs/                   # generated run reports
