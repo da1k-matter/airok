@@ -170,7 +170,8 @@ async fn main() -> Result<()> {
         .and_then(|id| id.strip_prefix("ranktrend-1d-").map(ToOwned::to_owned));
     let paper_config = paper_config(&config);
     let restored_state = ledger.load_engine_state(PAPER_SESSION_ID)?;
-    let bootstrap_previous_day = should_bootstrap_previous_day(restored_state.is_none(), no_bootstrap);
+    let bootstrap_previous_day =
+        should_bootstrap_previous_day(restored_state.is_none(), no_bootstrap);
     let engine = if let Some(state) = restored_state {
         PaperEngine::restore(paper_config, state)?
     } else {
