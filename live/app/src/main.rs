@@ -601,7 +601,8 @@ async fn run_previous_day_bootstrap(state: AppState, config: RuntimeConfig) -> R
         bail!("local history extends beyond the previous confirmed UTC day {yesterday}");
     }
     repair_market_to(&mut market, &bundle, yesterday, Vec::new(), &config).await?;
-    decide_for_latest(state, config, bundle, market, true).await
+    let bootstrap_closes = refresh_bootstrap_day(&mut market, &bundle, yesterday, &config).await?;
+    decide_for_latest(state, config, bundle, market, Some(bootstrap_closes)).await
 }
 
 async fn handle_confirmed_close(
@@ -619,7 +620,41 @@ async fn handle_confirmed_close(
         .map(|candle| candle.opened_at.date_naive())
         .context("confirmed daily candle batch is empty")?;
     repair_market_to(&mut market, &bundle, date, confirmed, &config).await?;
-    decide_for_latest(state, config, bundle, market, false).await
+    decide_for_latest(state, config, bundle, market, None).await
+}
+
+/// Fetch the bootstrap day again for every model asset. These exact candles both
+/// replace the last in-memory feature row and provide the only permitted entry
+/// anchors for a first paper session.
+async fn refresh_bootstrap_day(
+    market: &mut MarketPanel,
+    bundle: &BundleMetadata,
+    date: NaiveDate,
+    config: &RuntimeConfig,
+) -> Result<BTreeMap<String, f64>> {
+    let client = BybitPublicClient::default();
+    let candles = fetch_daily_range(
+        &client,
+        &bundle.universe.symbols,
+        date,
+        date,
+        config.bybit.rest_parallelism,
+    )
+    .await
+    .into_iter()
+    .filter(|candle| candle.opened_at.date_naive() == date)
+    .collect::<Vec<_>>();
+    if !candles.iter().any(|candle| candle.symbol == "BTC") {
+        bail!("cannot bootstrap {date}: confirmed BTC candle is unavailable");
+    }
+    merge_confirmed_daily_candles(market, &candles)?;
+    Ok(candles
+        .into_iter()
+        .filter_map(|candle| {
+            (candle.close.is_finite() && candle.close > 0.0)
+                .then_some((candle.symbol, candle.close))
+        })
+        .collect())
 }
 
 async fn repair_market_to(
@@ -729,7 +764,7 @@ async fn decide_for_latest(
     config: RuntimeConfig,
     bundle: BundleMetadata,
     market: MarketPanel,
-    is_bootstrap: bool,
+    bootstrap_closes: Option<BTreeMap<String, f64>>,
 ) -> Result<()> {
     let date = market
         .dates
@@ -778,6 +813,14 @@ async fn decide_for_latest(
             );
         }
     }
+    if let Some(closes) = bootstrap_closes.as_ref() {
+        for symbol in desired.keys() {
+            let base = base_symbol(symbol)?;
+            if !closes.contains_key(&base) {
+                bail!("bootstrap close is unavailable for {base}");
+            }
+        }
+    }
     let execution_inputs = fetch_execution_inputs(
         &client,
         desired,
@@ -786,20 +829,16 @@ async fn decide_for_latest(
         config.bybit.rest_parallelism,
     )
     .await;
-    let latest_row = market.dates.len() - 1;
     for (symbol, notional, rules, book) in execution_inputs {
         if book.mid_price().is_none() {
             eprintln!("skip {symbol}: order-book snapshot is not two-sided");
             continue;
         }
-        let report = if is_bootstrap {
+        let report = if let Some(closes) = bootstrap_closes.as_ref() {
             let base = base_symbol(&symbol)?;
-            let column = market
-                .symbols
-                .iter()
-                .position(|candidate| candidate == &base)
+            let close = *closes
+                .get(&base)
                 .with_context(|| format!("bootstrap close is unavailable for {base}"))?;
-            let close = f64::from(market.close.get(latest_row, column));
             state.engine.lock().bootstrap_to_notional(
                 &decision_id,
                 &symbol,
