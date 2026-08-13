@@ -601,7 +601,7 @@ async fn run_previous_day_bootstrap(state: AppState, config: RuntimeConfig) -> R
         bail!("local history extends beyond the previous confirmed UTC day {yesterday}");
     }
     repair_market_to(&mut market, &bundle, yesterday, Vec::new(), &config).await?;
-    decide_for_latest(state, config, bundle, market).await
+    decide_for_latest(state, config, bundle, market, true).await
 }
 
 async fn handle_confirmed_close(
@@ -619,7 +619,7 @@ async fn handle_confirmed_close(
         .map(|candle| candle.opened_at.date_naive())
         .context("confirmed daily candle batch is empty")?;
     repair_market_to(&mut market, &bundle, date, confirmed, &config).await?;
-    decide_for_latest(state, config, bundle, market).await
+    decide_for_latest(state, config, bundle, market, false).await
 }
 
 async fn repair_market_to(
@@ -729,6 +729,7 @@ async fn decide_for_latest(
     config: RuntimeConfig,
     bundle: BundleMetadata,
     market: MarketPanel,
+    is_bootstrap: bool,
 ) -> Result<()> {
     let date = market
         .dates
@@ -785,18 +786,37 @@ async fn decide_for_latest(
         config.bybit.rest_parallelism,
     )
     .await;
+    let latest_row = market.dates.len() - 1;
     for (symbol, notional, rules, book) in execution_inputs {
         if book.mid_price().is_none() {
             eprintln!("skip {symbol}: order-book snapshot is not two-sided");
             continue;
         }
-        let report = state.engine.lock().rebalance_to_notional(
-            &decision_id,
-            &symbol,
-            notional,
-            &rules,
-            &book,
-        )?;
+        let report = if is_bootstrap {
+            let base = base_symbol(&symbol)?;
+            let column = market
+                .symbols
+                .iter()
+                .position(|candidate| candidate == &base)
+                .with_context(|| format!("bootstrap close is unavailable for {base}"))?;
+            let close = f64::from(market.close.get(latest_row, column));
+            state.engine.lock().bootstrap_to_notional(
+                &decision_id,
+                &symbol,
+                notional,
+                close,
+                &rules,
+                &book,
+            )?
+        } else {
+            state.engine.lock().rebalance_to_notional(
+                &decision_id,
+                &symbol,
+                notional,
+                &rules,
+                &book,
+            )?
+        };
         if let Some(report) = report {
             state.ledger.lock().record_execution(&report, &book)?;
         }

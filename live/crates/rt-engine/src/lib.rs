@@ -148,6 +148,51 @@ impl PaperEngine {
         rules: &InstrumentRules,
         book: &OrderBookSnapshot,
     ) -> Result<Option<ExecutionReport>, EngineError> {
+        self.rebalance_to_notional_with_entry_anchor(
+            decision_id,
+            symbol,
+            target_notional,
+            rules,
+            book,
+            None,
+        )
+    }
+
+    /// Open or rebalance a bootstrap position from a historical close, while
+    /// preserving the current order book's executable impact.
+    pub fn bootstrap_to_notional(
+        &mut self,
+        decision_id: &str,
+        symbol: &str,
+        target_notional: f64,
+        close_price: f64,
+        rules: &InstrumentRules,
+        book: &OrderBookSnapshot,
+    ) -> Result<Option<ExecutionReport>, EngineError> {
+        if !close_price.is_finite() || close_price <= 0.0 {
+            return Err(EngineError::InvalidConfig(
+                "bootstrap close price must be finite and positive".to_owned(),
+            ));
+        }
+        self.rebalance_to_notional_with_entry_anchor(
+            decision_id,
+            symbol,
+            target_notional,
+            rules,
+            book,
+            Some(close_price),
+        )
+    }
+
+    fn rebalance_to_notional_with_entry_anchor(
+        &mut self,
+        decision_id: &str,
+        symbol: &str,
+        target_notional: f64,
+        rules: &InstrumentRules,
+        book: &OrderBookSnapshot,
+        entry_anchor: Option<f64>,
+    ) -> Result<Option<ExecutionReport>, EngineError> {
         let mark = book.mid_price().ok_or_else(|| {
             EngineError::InvalidConfig("order book lacks a two-sided mid".to_owned())
         })?;
@@ -156,7 +201,8 @@ impl PaperEngine {
             .positions
             .get(symbol)
             .map_or(0.0, |position| position.quantity);
-        let target_quantity = target_notional / mark;
+        let pricing_reference = entry_anchor.unwrap_or(mark);
+        let target_quantity = target_notional / pricing_reference;
         let delta = target_quantity - current_quantity;
         let rounded_delta = round_down(delta.abs(), rules.qty_step);
         if rounded_delta <= EPSILON {
@@ -168,7 +214,8 @@ impl PaperEngine {
             } else {
                 -rounded_delta
             };
-        let projected_gross = self.projected_gross_notional(symbol, proposed_quantity, mark);
+        let projected_gross =
+            self.projected_gross_notional(symbol, proposed_quantity, pricing_reference);
         let maximum = self.snapshot(book.captured_at).equity * self.config.risk.max_gross_leverage;
         if projected_gross > maximum + EPSILON {
             return Err(EngineError::GrossLeverageExceeded {
@@ -184,7 +231,15 @@ impl PaperEngine {
             quantity: rounded_delta,
             requested_at: book.captured_at,
         };
-        let report = execute_snapshot_sweep(&request, rules, book, self.config.execution)?;
+        let mut report = execute_snapshot_sweep(&request, rules, book, self.config.execution)?;
+        if let Some(close_price) = entry_anchor {
+            rebase_bootstrap_execution(
+                &mut report,
+                book,
+                close_price,
+                self.config.execution.fee_bps,
+            )?;
+        }
         self.apply_execution(&report, book.captured_at);
         Ok(Some(report))
     }
@@ -251,6 +306,46 @@ impl PaperEngine {
             self.positions.remove(&report.symbol);
         }
     }
+}
+
+fn rebase_bootstrap_execution(
+    report: &mut ExecutionReport,
+    book: &OrderBookSnapshot,
+    close_price: f64,
+    fee_bps: f64,
+) -> Result<(), EngineError> {
+    let Some(raw_vwap) = report.vwap else {
+        return Ok(());
+    };
+    let top_of_book = match report.side {
+        Side::Buy => book.best_ask(),
+        Side::Sell => book.best_bid(),
+    }
+    .ok_or_else(|| {
+        EngineError::InvalidConfig("order book lacks an executable best quote".to_owned())
+    })?;
+    if !raw_vwap.is_finite() || !top_of_book.is_finite() || top_of_book <= 0.0 {
+        return Err(EngineError::InvalidConfig(
+            "order book has an invalid executable price".to_owned(),
+        ));
+    }
+    let entry_price = match report.side {
+        Side::Buy => close_price + (raw_vwap - top_of_book),
+        Side::Sell => close_price - (top_of_book - raw_vwap),
+    };
+    if !entry_price.is_finite() || entry_price <= 0.0 {
+        return Err(EngineError::InvalidConfig(
+            "bootstrap close and order-book impact produce an invalid entry price".to_owned(),
+        ));
+    }
+    report.vwap = Some(entry_price);
+    report.notional = report.filled_quantity * entry_price;
+    report.fee = report.notional * fee_bps / 10_000.0;
+    report.slippage_bps = Some(match report.side {
+        Side::Buy => (raw_vwap / top_of_book - 1.0) * 10_000.0,
+        Side::Sell => (top_of_book / raw_vwap - 1.0) * 10_000.0,
+    });
+    Ok(())
 }
 
 fn round_down(value: f64, step: f64) -> f64 {
@@ -324,5 +419,91 @@ mod tests {
         assert!(report.fee > 0.0);
         assert_eq!(engine.positions().len(), 1);
         assert!(engine.snapshot(Utc::now()).equity < 1_000.0);
+    }
+
+    #[test]
+    fn bootstrap_anchors_entry_to_close_and_uses_top_of_book_impact() {
+        let mut engine = engine();
+        let mut impact_book = book();
+        impact_book.asks = vec![
+            PriceLevel {
+                price: 101.0,
+                quantity: 1.0,
+            },
+            PriceLevel {
+                price: 103.0,
+                quantity: 100.0,
+            },
+        ];
+        let report = engine
+            .bootstrap_to_notional(
+                "bootstrap",
+                "BTCUSDT",
+                200.0,
+                100.0,
+                &InstrumentRules {
+                    symbol: "BTCUSDT".to_owned(),
+                    status: "Trading".to_owned(),
+                    contract_type: "LinearPerpetual".to_owned(),
+                    qty_step: 0.001,
+                    min_qty: 0.001,
+                    min_notional_value: 5.0,
+                    max_market_order_qty: 150.0,
+                    tick_size: 0.1,
+                },
+                &impact_book,
+            )
+            .expect("bootstrap works")
+            .expect("trade is needed");
+
+        let expected_entry = 100.0 + (102.0 - 101.0);
+        assert!((report.vwap.expect("fill price") - expected_entry).abs() < 1e-9);
+        assert!(
+            (report.slippage_bps.expect("impact") - (102.0 / 101.0 - 1.0) * 10_000.0).abs() < 1e-9
+        );
+        assert!((engine.positions()[0].entry_vwap - expected_entry).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bootstrap_short_anchors_entry_to_close_and_uses_bid_impact() {
+        let mut engine = engine();
+        let mut impact_book = book();
+        impact_book.bids = vec![
+            PriceLevel {
+                price: 99.0,
+                quantity: 1.0,
+            },
+            PriceLevel {
+                price: 97.0,
+                quantity: 100.0,
+            },
+        ];
+        let report = engine
+            .bootstrap_to_notional(
+                "bootstrap",
+                "BTCUSDT",
+                -200.0,
+                100.0,
+                &InstrumentRules {
+                    symbol: "BTCUSDT".to_owned(),
+                    status: "Trading".to_owned(),
+                    contract_type: "LinearPerpetual".to_owned(),
+                    qty_step: 0.001,
+                    min_qty: 0.001,
+                    min_notional_value: 5.0,
+                    max_market_order_qty: 150.0,
+                    tick_size: 0.1,
+                },
+                &impact_book,
+            )
+            .expect("bootstrap works")
+            .expect("trade is needed");
+
+        let expected_entry = 100.0 - (99.0 - 98.0);
+        assert!((report.vwap.expect("fill price") - expected_entry).abs() < 1e-9);
+        assert!(
+            (report.slippage_bps.expect("impact") - (99.0 / 98.0 - 1.0) * 10_000.0).abs() < 1e-9
+        );
+        assert!((engine.positions()[0].entry_vwap - expected_entry).abs() < 1e-9);
     }
 }

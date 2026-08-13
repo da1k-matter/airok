@@ -30,7 +30,7 @@ The default runtime configuration reads the shared historical candle directory a
 
 ### First paper-session bootstrap
 
-For a brand-new paper session, the default launch automatically bootstraps exactly one paper decision from yesterday's confirmed UTC candle. It rebuilds missing causal OHLCV history when needed, then waits for subsequent 1D closes through WebSocket. No paper trades are backfilled for missed days.
+For a brand-new paper session, the default launch automatically bootstraps exactly one paper decision from yesterday's confirmed UTC candle. It rebuilds missing causal OHLCV history when needed, sizes and records each entry from that candle's close, and applies only the current order book's executable impact from the best quote to the fill VWAP. It then waits for subsequent 1D closes through WebSocket. No paper trades are backfilled for missed days.
 
 ```bash
 cargo run --release -p ranktrend-paper -- --config config/paper.toml
