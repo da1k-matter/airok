@@ -14,9 +14,15 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from bybit import BybitInstrumentRule, fetch_linear_perpetual_rules
 from config import ExperimentConfig
 from data import data_fingerprint, load_context, load_panel, save_context, validate_data
-from portfolio import average_portfolios, build_weights, simulate_pnl
+from portfolio import (
+    average_portfolios,
+    build_weights,
+    simulate_bybit_market_pnl,
+    simulate_target_weight_pnl,
+)
 from reporting import environment_text, git_commit, metrics, save_plots, yearly_table
 from research import (
     FEATURE_VERSION,
@@ -167,6 +173,48 @@ def _latest_weights_table(ctx: dict[str, Any], weights: np.ndarray, row: int) ->
     return frame.sort_values("weight", ascending=False).reset_index(drop=True)
 
 
+def _bybit_rule_arrays(
+    symbols: list[str], rules: dict[str, BybitInstrumentRule]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    tradable = np.zeros(len(symbols), dtype=bool)
+    qty_step = np.ones(len(symbols), dtype=np.float64)
+    min_qty = np.full(len(symbols), np.inf, dtype=np.float64)
+    min_notional = np.full(len(symbols), np.inf, dtype=np.float64)
+    max_market_qty = np.zeros(len(symbols), dtype=np.float64)
+    for index, base in enumerate(symbols):
+        rule = rules.get(f"{base}USDT")
+        if rule is None or not rule.tradable_linear_perpetual:
+            continue
+        tradable[index] = True
+        qty_step[index] = rule.qty_step
+        min_qty[index] = rule.min_order_qty
+        min_notional[index] = rule.min_notional_value
+        max_market_qty[index] = rule.max_market_order_qty
+    return tradable, qty_step, min_qty, min_notional, max_market_qty
+
+
+def _bybit_rule_table(symbols: list[str], rules: dict[str, BybitInstrumentRule]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for base in symbols:
+        bybit_symbol = f"{base}USDT"
+        rule = rules.get(bybit_symbol)
+        rows.append(
+            {
+                "base_symbol": base,
+                "bybit_symbol": bybit_symbol,
+                "tradable_linear_perpetual": bool(rule and rule.tradable_linear_perpetual),
+                "status": rule.status if rule else "missing",
+                "contract_type": rule.contract_type if rule else "missing",
+                "qty_step": rule.qty_step if rule else np.nan,
+                "min_order_qty": rule.min_order_qty if rule else np.nan,
+                "min_notional_value": rule.min_notional_value if rule else np.nan,
+                "max_market_order_qty": rule.max_market_order_qty if rule else np.nan,
+                "tick_size": rule.tick_size if rule else np.nan,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def backtest(
     config: ExperimentConfig,
     ctx: dict[str, Any],
@@ -189,7 +237,27 @@ def backtest(
     weights[end_idx + 1 :] = 0.0
 
     cost = float(config.section("costs")["one_way_bps"]) / 10_000.0
-    pnl, turnover = simulate_pnl(weights, np.asarray(ctx["oo_ret"]), cost)
+    execution = config.section("execution")
+    ideal_pnl, ideal_turnover = simulate_target_weight_pnl(weights, np.asarray(ctx["oo_ret"]), cost)
+    bybit_rules, bybit_snapshot = fetch_linear_perpetual_rules()
+    tradable, qty_step, min_qty, min_notional, max_market_qty = _bybit_rule_arrays(
+        list(ctx["symbols"]), bybit_rules
+    )
+    executable_targets = weights.copy()
+    executable_targets[:, ~tradable] = 0.0
+    executed = simulate_bybit_market_pnl(
+        executable_targets,
+        np.asarray(ctx["open"]),
+        np.asarray(ctx["oo_ret"]),
+        cost,
+        initial_equity_usd=float(execution["initial_equity_usd"]),
+        gross_leverage=float(execution["gross_leverage"]),
+        qty_step=qty_step,
+        min_order_qty=min_qty,
+        min_notional_value=min_notional,
+        max_market_order_qty=max_market_qty,
+    )
+    pnl, turnover = executed.pnl, executed.turnover
     effective_end = str(dates[end_idx].date())
     full_metrics, full_monthly = metrics(pnl, turnover, dates, oos_start, effective_end, periods_per_year)
     latest_metrics, _ = metrics(pnl, turnover, dates, latest_start, effective_end, periods_per_year)
@@ -202,14 +270,27 @@ def backtest(
         },
         "full": full_metrics,
         "latest_year": latest_metrics,
+        "ideal_weight_baseline": metrics(
+            ideal_pnl, ideal_turnover, dates, latest_start, effective_end, periods_per_year
+        )[0],
+        "execution": {
+            "initial_equity_usd": float(execution["initial_equity_usd"]),
+            "gross_leverage": float(execution["gross_leverage"]),
+            "venue": str(execution["venue"]),
+            "order_type": str(execution["order_type"]),
+            "bybit_rule_snapshot": "bybit_instrument_rules.json",
+            "tradable_symbols": int(tradable.sum()),
+            "unavailable_symbols": int((~tradable).sum()),
+        },
     }
 
     output = _run_directory(config)
     (output / "config_resolved.yaml").write_text(yaml.safe_dump(config.raw, sort_keys=False), encoding="utf-8")
     (output / "environment.txt").write_text(environment_text(), encoding="utf-8")
+    _bybit_rule_table(list(ctx["symbols"]), bybit_rules).to_csv(output / "bybit_symbol_rules.csv", index=False)
 
     mask = (dates >= pd.Timestamp(oos_start)) & (dates <= pd.Timestamp(effective_end))
-    dated_weights = weights[mask]
+    dated_weights = executed.held_weights[mask]
     beta_exposure = np.nansum(dated_weights * np.asarray(ctx["beta60"])[mask], axis=1)
     daily = pd.DataFrame(
         {
@@ -219,10 +300,18 @@ def backtest(
             "gross_exposure": np.abs(dated_weights).sum(axis=1),
             "net_exposure": dated_weights.sum(axis=1),
             "beta_exposure": beta_exposure,
+            "ideal_net_return": ideal_pnl[mask],
+            "ideal_turnover": ideal_turnover[mask],
+            "rejected_notional_usd": executed.rejected_notional[mask],
+            "attempted_orders": executed.attempted_orders[mask],
+            "executed_orders": executed.executed_orders[mask],
+            "skipped_orders": executed.skipped_orders[mask],
         }
     )
     daily["equity"] = (1.0 + daily["net_return"]).cumprod()
     daily["drawdown"] = daily["equity"] / daily["equity"].cummax() - 1.0
+    daily["ideal_equity"] = (1.0 + daily["ideal_net_return"]).cumprod()
+    daily["ideal_drawdown"] = daily["ideal_equity"] / daily["ideal_equity"].cummax() - 1.0
     daily.to_csv(output / "daily.csv", index=False)
     full_monthly.rename("return").to_csv(output / "monthly.csv", header=True)
     yearly_table(pnl, turnover, dates, oos_start, effective_end, periods_per_year).to_csv(
@@ -231,14 +320,26 @@ def backtest(
 
     fee_rows: list[dict[str, Any]] = []
     for bps in evaluation.get("fee_stress_bps", [5, 10, 15, 20, 30]):
-        fee_pnl, fee_turnover = simulate_pnl(weights, np.asarray(ctx["oo_ret"]), float(bps) / 10_000.0)
+        fee_execution = simulate_bybit_market_pnl(
+            executable_targets,
+            np.asarray(ctx["open"]),
+            np.asarray(ctx["oo_ret"]),
+            float(bps) / 10_000.0,
+            initial_equity_usd=float(execution["initial_equity_usd"]),
+            gross_leverage=float(execution["gross_leverage"]),
+            qty_step=qty_step,
+            min_order_qty=min_qty,
+            min_notional_value=min_notional,
+            max_market_order_qty=max_market_qty,
+        )
         for label, start in (("full", oos_start), ("latest_year", latest_start)):
-            row, _ = metrics(fee_pnl, fee_turnover, dates, start, effective_end, periods_per_year)
+            row, _ = metrics(fee_execution.pnl, fee_execution.turnover, dates, start, effective_end, periods_per_year)
             fee_rows.append({"one_way_bps": bps, "period": label, **row})
     pd.DataFrame(fee_rows).to_csv(output / "fee_stress.csv", index=False)
 
-    latest = _latest_weights_table(ctx, weights, end_idx)
+    latest = _latest_weights_table(ctx, executed.held_weights, end_idx)
     latest.to_csv(output / "latest_weights.csv", index=False)
+    _latest_weights_table(ctx, executable_targets, end_idx).to_csv(output / "latest_target_weights.csv", index=False)
 
     summary["exposures"] = {
         "average_gross": float(daily["gross_exposure"].mean()),
@@ -246,8 +347,17 @@ def backtest(
         "average_absolute_beta": float(daily["beta_exposure"].abs().mean()),
         "mean_active_assets": float((np.abs(dated_weights) > 1e-8).sum(axis=1).mean()),
     }
+    summary["execution"].update(
+        {
+            "attempted_orders": int(executed.attempted_orders[mask].sum()),
+            "executed_orders": int(executed.executed_orders[mask].sum()),
+            "skipped_orders": int(executed.skipped_orders[mask].sum()),
+            "rejected_notional_usd": float(executed.rejected_notional[mask].sum()),
+        }
+    )
     summary["seed_rank_correlation"] = _seed_rank_correlation(seed_scores, mask)
     (output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (output / "bybit_instrument_rules.json").write_text(json.dumps(bybit_snapshot, indent=2), encoding="utf-8")
     metadata = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "config_hash": config.config_hash,

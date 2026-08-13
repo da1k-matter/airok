@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -9,7 +10,7 @@ from numba import njit
 
 
 @njit(cache=True)
-def simulate_pnl(weights: np.ndarray, open_to_open_return: np.ndarray, one_way_cost: float):
+def simulate_target_weight_pnl(weights: np.ndarray, open_to_open_return: np.ndarray, one_way_cost: float):
     t_count, n_assets = weights.shape
     pnl = np.zeros(t_count, dtype=np.float64)
     turnover = np.zeros(t_count, dtype=np.float64)
@@ -27,6 +28,99 @@ def simulate_pnl(weights: np.ndarray, open_to_open_return: np.ndarray, one_way_c
         turnover[t] = traded
         pnl[t] = gross_return - one_way_cost * traded
     return pnl, turnover
+
+
+@dataclass(frozen=True)
+class BybitExecutionSimulation:
+    pnl: np.ndarray
+    turnover: np.ndarray
+    held_weights: np.ndarray
+    rejected_notional: np.ndarray
+    attempted_orders: np.ndarray
+    executed_orders: np.ndarray
+    skipped_orders: np.ndarray
+
+
+def simulate_bybit_market_pnl(
+    target_weights: np.ndarray,
+    open_prices: np.ndarray,
+    open_to_open_return: np.ndarray,
+    one_way_cost: float,
+    initial_equity_usd: float,
+    gross_leverage: float,
+    qty_step: np.ndarray,
+    min_order_qty: np.ndarray,
+    min_notional_value: np.ndarray,
+    max_market_order_qty: np.ndarray,
+) -> BybitExecutionSimulation:
+    """Execute one Bybit linear-perpetual market order per symbol and day.
+
+    The order quantity is rounded down to the instrument qty step before every
+    Bybit lot-size validation. Rejected deltas remain as tracking error until a
+    later rebalance is valid under the same current rule snapshot.
+    """
+    if initial_equity_usd <= 0.0 or gross_leverage <= 0.0:
+        raise ValueError("Execution equity and gross leverage must be positive")
+
+    t_count, n_assets = target_weights.shape
+    pnl = np.zeros(t_count, dtype=np.float64)
+    turnover = np.zeros(t_count, dtype=np.float64)
+    held_weights = np.zeros((t_count, n_assets), dtype=np.float32)
+    rejected_notional = np.zeros(t_count, dtype=np.float64)
+    attempted_orders = np.zeros(t_count, dtype=np.int32)
+    executed_orders = np.zeros(t_count, dtype=np.int32)
+    skipped_orders = np.zeros(t_count, dtype=np.int32)
+    held_quantity = np.zeros(n_assets, dtype=np.float64)
+    equity = float(initial_equity_usd)
+
+    for t in range(t_count - 1):
+        if equity <= 0.0:
+            break
+        prices = open_prices[t].astype(np.float64)
+        valid_price = np.isfinite(prices) & (prices > 0.0)
+        target_notional = target_weights[t].astype(np.float64) * equity * gross_leverage
+        current_notional = held_quantity * prices
+        delta_notional = target_notional - current_notional
+        active = valid_price & (np.abs(delta_notional) > 1e-12)
+        attempted_orders[t] = int(active.sum())
+        requested_quantity = np.zeros(n_assets, dtype=np.float64)
+        requested_quantity[active] = delta_notional[active] / prices[active]
+        rounded_quantity = np.sign(requested_quantity) * (
+            np.floor(np.abs(requested_quantity) / qty_step + 1e-6) * qty_step
+        )
+        rounded_notional = np.abs(rounded_quantity) * prices
+        executable = (
+            active
+            & (np.abs(rounded_quantity) + 1e-12 >= min_order_qty)
+            & (rounded_notional + 1e-8 * np.maximum(1.0, min_notional_value) >= min_notional_value)
+            & (np.abs(rounded_quantity) <= max_market_order_qty + 1e-12)
+        )
+        rejected = active & ~executable
+        held_quantity[executable] += rounded_quantity[executable]
+        executed_notional = float(rounded_notional[executable].sum())
+        rejected_notional[t] = float(np.abs(delta_notional[rejected]).sum())
+        executed_orders[t] = int(executable.sum())
+        skipped_orders[t] = int(rejected.sum())
+        turnover[t] = executed_notional / equity
+        held_weights[t] = (held_quantity * prices / (equity * gross_leverage)).astype(np.float32)
+
+        returns = open_to_open_return[t].astype(np.float64)
+        valid = valid_price & np.isfinite(returns)
+        gross_pnl = float(np.dot((held_quantity * prices)[valid], returns[valid]))
+        fees = one_way_cost * executed_notional
+        pnl[t] = (gross_pnl - fees) / equity
+        equity += gross_pnl - fees
+        # Quantity is invariant between rebalances; next day's price marks it.
+
+    return BybitExecutionSimulation(
+        pnl=pnl,
+        turnover=turnover,
+        held_weights=held_weights,
+        rejected_notional=rejected_notional,
+        attempted_orders=attempted_orders,
+        executed_orders=executed_orders,
+        skipped_orders=skipped_orders,
+    )
 
 
 def _side_weights(volatility: np.ndarray, selected: np.ndarray, mode: str) -> np.ndarray:

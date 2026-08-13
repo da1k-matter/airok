@@ -2,7 +2,8 @@ const currency = new Intl.NumberFormat('en-US', { style: 'currency', currency: '
 const quantity = new Intl.NumberFormat('en-US', { maximumFractionDigits: 5 });
 const money = value => Number.isFinite(value) ? currency.format(value) : '—';
 const signedMoney = value => Number.isFinite(value) ? `${value > 0 ? '+' : value < 0 ? '−' : ''}${currency.format(Math.abs(value))}` : '—';
-const price = value => Number.isFinite(value) ? Number(value).toPrecision(8) : '—';
+const priceFormat = new Intl.NumberFormat('en-US', { maximumFractionDigits: 12 });
+const price = value => Number.isFinite(value) ? priceFormat.format(Number(value)) : '—';
 const slippage = value => Number.isFinite(value) ? `${value >= 0 ? '+' : ''}${Number(value).toFixed(2)} bps` : '—';
 const classFor = value => value > 0 ? 'pos' : value < 0 ? 'neg' : '';
 const escapeHtml = value => String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#039;');

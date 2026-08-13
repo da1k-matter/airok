@@ -72,6 +72,7 @@ def _validate(raw: dict[str, Any]) -> None:
         "ensemble",
         "portfolio",
         "costs",
+        "execution",
         "evaluation",
     }
     missing = sorted(required - raw.keys())
@@ -117,6 +118,15 @@ def _validate(raw: dict[str, Any]) -> None:
         raise ValueError("portfolio.tail_count must be positive")
     if has_fraction and not 0 < float(portfolio["tail_fraction"]) < 0.5:
         raise ValueError("portfolio.tail_fraction must be between 0 and 0.5")
+
+    execution = raw["execution"]
+    for key in ("initial_equity_usd", "gross_leverage"):
+        if not float(execution[key]) > 0.0:
+            raise ValueError(f"execution.{key} must be positive")
+    if str(execution.get("venue", "")) != "bybit_linear":
+        raise ValueError("execution.venue must be bybit_linear")
+    if str(execution.get("order_type", "")) != "market":
+        raise ValueError("execution.order_type must be market")
 
 
 def load_config(path: str | Path, data_dir_override: str | Path | None = None) -> ExperimentConfig:

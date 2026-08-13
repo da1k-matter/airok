@@ -203,7 +203,12 @@ async fn main() -> Result<()> {
             "Waiting for a confirmed 1D close. Use --bootstrap-previous-day only for a fresh paper session.",
         );
     }
-    tokio::spawn(run_live_loop(state.clone(), config, bootstrap_previous_day));
+    tokio::spawn(run_live_loop(
+        state.clone(),
+        config.clone(),
+        bootstrap_previous_day,
+    ));
+    tokio::spawn(run_open_position_mark_loop(state.clone(), config));
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/health", get(health))
@@ -333,10 +338,10 @@ fn paper_config(config: &RuntimeConfig) -> PaperConfig {
 }
 
 async fn run_live_loop(state: AppState, config: RuntimeConfig, bootstrap_previous_day: bool) {
-    if bootstrap_previous_day {
-        if let Err(error) = run_previous_day_bootstrap(state.clone(), config.clone()).await {
-            set_error(&state, error);
-        }
+    if bootstrap_previous_day
+        && let Err(error) = run_previous_day_bootstrap(state.clone(), config.clone()).await
+    {
+        set_error(&state, error);
     }
     loop {
         let client = BybitPublicClient::default();
@@ -420,6 +425,82 @@ async fn run_live_loop(state: AppState, config: RuntimeConfig, bootstrap_previou
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+/// Keep one-minute Bybit candle subscriptions open only for the currently held paper book.
+async fn run_open_position_mark_loop(state: AppState, config: RuntimeConfig) {
+    loop {
+        let symbols = open_position_symbols(&state);
+        if symbols.is_empty() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+        let client = BybitPublicClient::default();
+        let mut socket = match client.connect_minute_ws().await {
+            Ok(socket) => socket,
+            Err(error) => {
+                eprintln!("open-position minute mark WebSocket connect failed: {error:#}");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+        if let Err(error) = socket.subscribe(&symbols, config.bybit.ws_batch_size).await {
+            eprintln!("open-position minute mark WebSocket subscription failed: {error:#}");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+        let mut membership_check = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                candle = socket.next_confirmed_candle() => match candle {
+                    Ok(candle) => {
+                        if let Err(error) = record_open_position_mark(&state, candle).await {
+                            eprintln!("open-position minute mark update failed: {error:#}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("open-position minute mark WebSocket failed: {error:#}");
+                        break;
+                    }
+                },
+                _ = membership_check.tick() => {
+                    if open_position_symbols(&state) != symbols {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn open_position_symbols(state: &AppState) -> Vec<String> {
+    state
+        .engine
+        .lock()
+        .positions()
+        .into_iter()
+        .map(|position| position.symbol)
+        .collect()
+}
+
+async fn record_open_position_mark(state: &AppState, candle: Candle) -> Result<()> {
+    let now = Utc::now();
+    let (snapshot, persisted) = {
+        let mut engine = state.engine.lock();
+        if !engine
+            .positions()
+            .iter()
+            .any(|position| position.symbol == candle.symbol)
+        {
+            return Ok(());
+        }
+        engine.mark(&candle.symbol, candle.close, now);
+        (engine.snapshot(now), engine.persistent_state())
+    };
+    let ledger = state.ledger.lock();
+    ledger.record_snapshot(&snapshot)?;
+    ledger.save_engine_state(&persisted, now)?;
+    Ok(())
 }
 
 async fn subscription_symbols(

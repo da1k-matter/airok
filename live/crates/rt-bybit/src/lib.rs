@@ -221,6 +221,13 @@ impl BybitPublicClient {
             pending: VecDeque::new(),
         })
     }
+
+    pub async fn connect_minute_ws(&self) -> Result<BybitMinuteWs> {
+        let (stream, _) = connect_async(&self.ws_url)
+            .await
+            .context("connect Bybit public minute WebSocket")?;
+        Ok(BybitMinuteWs { stream })
+    }
 }
 
 pub struct BybitDailyWs {
@@ -260,7 +267,7 @@ impl BybitDailyWs {
             let message = message.context("read Bybit subscription response")?;
             match message {
                 Message::Text(text) => {
-                    if let Some(candle) = parse_ws_kline(&text)? {
+                    if let Some(candle) = parse_ws_kline(&text, "kline.D.")? {
                         self.pending.push_back(candle);
                         continue;
                     }
@@ -289,7 +296,7 @@ impl BybitDailyWs {
             let message = message.context("read Bybit WebSocket frame")?;
             match message {
                 Message::Text(text) => {
-                    if let Some(candle) = parse_ws_kline(&text)? {
+                    if let Some(candle) = parse_ws_kline(&text, "kline.D.")? {
                         return Ok(candle);
                     }
                 }
@@ -303,6 +310,80 @@ impl BybitDailyWs {
             }
         }
         bail!("Bybit public WebSocket stream ended")
+    }
+}
+
+pub struct BybitMinuteWs {
+    stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+}
+
+impl BybitMinuteWs {
+    pub async fn subscribe(&mut self, symbols: &[String], batch_size: usize) -> Result<()> {
+        if symbols.is_empty() {
+            bail!("cannot subscribe to an empty minute symbol set");
+        }
+        for (index, chunk) in symbols.chunks(batch_size.max(1)).enumerate() {
+            let topics = chunk
+                .iter()
+                .map(|symbol| format!("kline.1.{symbol}"))
+                .collect::<Vec<_>>();
+            self.stream
+                .send(Message::Text(
+                    json!({ "op": "subscribe", "args": topics })
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .context("subscribe Bybit minute kline topics")?;
+            self.await_subscription_ack().await?;
+            if index + 1 < symbols.chunks(batch_size.max(1)).len() {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn await_subscription_ack(&mut self) -> Result<()> {
+        while let Some(message) = self.stream.next().await {
+            match message.context("read Bybit minute subscription response")? {
+                Message::Text(text) => {
+                    if is_subscription_ack(&text)? {
+                        return Ok(());
+                    }
+                }
+                Message::Ping(payload) => self
+                    .stream
+                    .send(Message::Pong(payload))
+                    .await
+                    .context("reply Bybit ping during minute subscription")?,
+                Message::Close(_) => {
+                    bail!("Bybit public minute WebSocket closed during subscription")
+                }
+                _ => {}
+            }
+        }
+        bail!("Bybit public minute WebSocket ended before subscription acknowledgement")
+    }
+
+    /// Return a completed one-minute candle only; partial candles never alter paper marks.
+    pub async fn next_confirmed_candle(&mut self) -> Result<Candle> {
+        while let Some(message) = self.stream.next().await {
+            match message.context("read Bybit minute WebSocket frame")? {
+                Message::Text(text) => {
+                    if let Some(candle) = parse_ws_kline(&text, "kline.1.")? {
+                        return Ok(candle);
+                    }
+                }
+                Message::Ping(payload) => self
+                    .stream
+                    .send(Message::Pong(payload))
+                    .await
+                    .context("reply Bybit minute ping")?,
+                Message::Close(_) => bail!("Bybit public minute WebSocket closed"),
+                _ => {}
+            }
+        }
+        bail!("Bybit public minute WebSocket stream ended")
     }
 }
 
@@ -416,12 +497,12 @@ fn parse_kline_row(symbol: &str, row: &[String], confirmed: bool) -> Result<Cand
     })
 }
 
-fn parse_ws_kline(source: &str) -> Result<Option<Candle>> {
+fn parse_ws_kline(source: &str, topic_prefix: &str) -> Result<Option<Candle>> {
     let root: Value = serde_json::from_str(source).context("parse Bybit WebSocket JSON")?;
     let Some(topic) = root.get("topic").and_then(Value::as_str) else {
         return Ok(None);
     };
-    let Some(symbol) = topic.strip_prefix("kline.D.") else {
+    let Some(symbol) = topic.strip_prefix(topic_prefix) else {
         return Ok(None);
     };
     let Some(data) = root
@@ -485,14 +566,28 @@ mod tests {
     #[test]
     fn accepts_only_confirmed_daily_kline() {
         let message = r#"{"topic":"kline.D.BTCUSDT","data":[{"start":1786579200000,"open":"100","high":"105","low":"99","close":"102","volume":"42","confirm":true}]}"#;
-        let candle = parse_ws_kline(message)
+        let candle = parse_ws_kline(message, "kline.D.")
             .expect("parse succeeds")
             .expect("confirmed candle");
         assert_eq!(candle.symbol, "BTCUSDT");
         assert_eq!(candle.close, 102.0);
 
         let partial = message.replace("\"confirm\":true", "\"confirm\":false");
-        assert!(parse_ws_kline(&partial).expect("parse succeeds").is_none());
+        assert!(
+            parse_ws_kline(&partial, "kline.D.")
+                .expect("parse succeeds")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn accepts_only_confirmed_minute_kline() {
+        let message = r#"{"topic":"kline.1.BTCUSDT","data":[{"start":1786579200000,"open":"100","high":"105","low":"99","close":"102","volume":"42","confirm":true}]}"#;
+        let candle = parse_ws_kline(message, "kline.1.")
+            .expect("parse succeeds")
+            .expect("confirmed minute candle");
+        assert_eq!(candle.symbol, "BTCUSDT");
+        assert_eq!(candle.close, 102.0);
     }
 
     #[test]

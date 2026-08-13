@@ -5,6 +5,7 @@ from portfolio import (
     _project_dollar_and_beta,
     average_portfolios,
     overlay_multiplier,
+    simulate_bybit_market_pnl,
     smooth_fixed_window,
 )
 from reporting import metrics
@@ -76,3 +77,25 @@ def test_btc_vol_overlay_uses_lagged_median():
     }
     got = overlay_multiplier(ctx, config)
     np.testing.assert_allclose(got, [1.0, 1.0, 0.75, 1.1, 0.75, 1.1])
+
+
+def test_bybit_execution_rounds_quantity_and_retains_invalid_deltas():
+    weights = np.array([[0.02], [0.025], [0.0], [0.0]], dtype=np.float32)
+    returns = np.zeros_like(weights)
+    result = simulate_bybit_market_pnl(
+        weights,
+        np.full_like(weights, 100.0),
+        returns,
+        one_way_cost=0.0,
+        initial_equity_usd=1_000.0,
+        gross_leverage=1.0,
+        qty_step=np.array([0.1]),
+        min_order_qty=np.array([0.1]),
+        min_notional_value=np.array([10.0]),
+        max_market_order_qty=np.array([100.0]),
+    )
+    np.testing.assert_allclose(result.held_weights[:3, 0], [0.02, 0.02, 0.0])
+    np.testing.assert_allclose(result.turnover[:3], [0.02, 0.0, 0.02])
+    np.testing.assert_allclose(result.rejected_notional[:3], [0.0, 5.0, 0.0], atol=1e-5)
+    np.testing.assert_array_equal(result.executed_orders[:3], [1, 0, 1])
+    np.testing.assert_array_equal(result.skipped_orders[:3], [0, 1, 0])

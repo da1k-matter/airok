@@ -52,6 +52,11 @@ portfolio:
     high_vol_multiplier: 0.75
 costs:
   one_way_bps: 10.0
+execution:
+  initial_equity_usd: 1000.0
+  gross_leverage: 1.0
+  venue: bybit_linear
+  order_type: market
 evaluation:
   oos_start: 2023-08-05
   oos_end: 2026-08-04
