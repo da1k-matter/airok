@@ -79,27 +79,16 @@ function sortRows(rows, table) {
   });
 }
 
-function closedDailyEquity(rows) {
-  const today = new Date().toISOString().slice(0, 10), byDate = new Map();
-  rows.forEach(row => {
-    const date = row.captured_at.slice(0, 10);
-    if (date < today) byDate.set(date, row.equity);
-  });
-  return [...byDate.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, equity]) => equity);
-}
-
-function performanceMetrics(rows, currentEquity) {
-  if (!rows.length) return {};
-  const initial = rows[0].equity, totalPnl = currentEquity - initial, totalReturn = initial ? totalPnl / initial : null;
-  let peak = -Infinity, maxDrawdown = 0;
-  rows.forEach(row => { peak = Math.max(peak, row.equity); if (peak > 0) maxDrawdown = Math.min(maxDrawdown, row.equity / peak - 1); });
-  const dailyEquity = closedDailyEquity(rows), returns = dailyEquity.slice(1).map((value, index) => value / dailyEquity[index] - 1).filter(Number.isFinite);
-  if (returns.length < 2) return { totalPnl, totalReturn, maxDrawdown };
+function performanceMetrics(rows, currentEquity, initialEquity) {
+  const totalPnl = currentEquity - initialEquity, totalReturn = initialEquity ? totalPnl / initialEquity : null;
+  if (!rows.length) return { totalPnl, totalReturn };
+  const dailyEquity = rows.map(row => row.equity), dailyPnl = dailyEquity.slice(1).map((value, index) => value - dailyEquity[index]).filter(Number.isFinite), returns = dailyEquity.slice(1).map((value, index) => value / dailyEquity[index] - 1).filter(Number.isFinite);
+  if (!returns.length) return { totalPnl, totalReturn };
   const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
-  const variance = returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (returns.length - 1);
-  const losses = returns.filter(value => value < 0), gains = returns.filter(value => value > 0);
+  const variance = returns.length > 1 ? returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (returns.length - 1) : null;
+  const losses = dailyPnl.filter(value => value < 0), gains = dailyPnl.filter(value => value > 0);
   return {
-    totalPnl, totalReturn, maxDrawdown,
+    totalPnl, totalReturn,
     sharpe: variance > 0 ? mean / Math.sqrt(variance) * Math.sqrt(365) : null,
     profitFactor: losses.length && gains.length ? gains.reduce((sum, value) => sum + value, 0) / Math.abs(losses.reduce((sum, value) => sum + value, 0)) : null,
     winRate: gains.length + losses.length ? gains.length / (gains.length + losses.length) : null,
@@ -107,12 +96,13 @@ function performanceMetrics(rows, currentEquity) {
   };
 }
 
-function renderPerformance(rows, equity) {
-  const metrics = performanceMetrics(rows, equity);
+function renderPerformance(rows, equity, initialEquity, dailyMaxDrawdown, intradayMaxDrawdown) {
+  const metrics = performanceMetrics(rows, equity, initialEquity);
   const set = (id, value, className = '') => { const element = document.querySelector(id); element.textContent = value; element.className = className; };
   set('#total-pnl', Number.isFinite(metrics.totalPnl) ? signedMoney(metrics.totalPnl) : '—', classFor(metrics.totalPnl));
   set('#total-pnl-return', Number.isFinite(metrics.totalReturn) ? `${percent(metrics.totalReturn)} since inception` : '—', classFor(metrics.totalReturn));
-  set('#max-drawdown', Number.isFinite(metrics.maxDrawdown) ? percent(metrics.maxDrawdown) : '—', metrics.maxDrawdown < 0 ? 'neg' : '');
+  set('#max-drawdown', Number.isFinite(dailyMaxDrawdown) ? percent(dailyMaxDrawdown) : '—', dailyMaxDrawdown < 0 ? 'neg' : '');
+  set('#intraday-max-drawdown', Number.isFinite(intradayMaxDrawdown) ? `Intraday: ${percent(intradayMaxDrawdown)}` : 'Intraday: —', intradayMaxDrawdown < 0 ? 'neg' : '');
   set('#sharpe', Number.isFinite(metrics.sharpe) ? metrics.sharpe.toFixed(2) : '—', classFor(metrics.sharpe));
   set('#profit-factor', Number.isFinite(metrics.profitFactor) ? metrics.profitFactor.toFixed(2) : '—', classFor((metrics.profitFactor ?? 1) - 1));
   set('#win-rate', Number.isFinite(metrics.winRate) ? `${(metrics.winRate * 100).toFixed(1)}%` : '—', classFor((metrics.winRate ?? .5) - .5));
@@ -146,7 +136,7 @@ async function refresh() {
     const account = session.account, replay = session.status === 'historical_replay';
     document.querySelector('#live-dot').classList.remove('offline'); document.querySelector('#status').textContent = session.status.replaceAll('_', ' ').toUpperCase(); document.querySelector('#last-updated').textContent = '3s refresh'; document.querySelector('#mode-label').textContent = replay ? 'Historical OOS replay / frozen model' : 'Cross-sectional crypto ranking';
     document.querySelector('#equity').textContent = money(account.equity); document.querySelector('#fees').textContent = money(account.fee_paid); document.querySelector('#equity-meta').textContent = session.last_decision_date || 'Awaiting first close'; document.querySelector('#model-info').textContent = `Frozen ${session.model.backend.toUpperCase()} ensemble · h${session.model.horizon_days} · ${session.model.seed_count} seeds · cut-off ${session.model.cutoff_date}`;
-    currentEquity = account.equity; latestEquity = equity; renderPerformance(equity, currentEquity); renderTrades(executions); renderPositions(positions, executions, currentEquity); if (document.querySelector('#equity-view').classList.contains('active')) drawChart(equity);
+    currentEquity = account.equity; latestEquity = equity; renderPerformance(equity, currentEquity, session.session_start_equity_usd, session.daily_max_drawdown, session.intraday_max_drawdown); renderTrades(executions); renderPositions(positions, executions, currentEquity); if (document.querySelector('#equity-view').classList.contains('active')) drawChart(equity);
   } catch (_) { document.querySelector('#live-dot').classList.add('offline'); document.querySelector('#status').textContent = 'API UNAVAILABLE'; document.querySelector('#last-updated').textContent = 'Retrying'; }
 }
 refresh(); setInterval(refresh, 3000); window.addEventListener('resize', () => { if (document.querySelector('#equity-view').classList.contains('active')) drawChart(latestEquity); });

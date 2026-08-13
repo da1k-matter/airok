@@ -131,6 +131,9 @@ struct SessionView {
     detail: String,
     model: ModelView,
     account: AccountSnapshot,
+    session_start_equity_usd: f64,
+    daily_max_drawdown: f64,
+    intraday_max_drawdown: f64,
     last_decision_date: Option<String>,
     last_error: Option<String>,
 }
@@ -619,8 +622,33 @@ async fn handle_confirmed_close(
         .first()
         .map(|candle| candle.opened_at.date_naive())
         .context("confirmed daily candle batch is empty")?;
-    repair_market_to(&mut market, &bundle, date, confirmed, &config).await?;
+    let closes = repair_market_to(&mut market, &bundle, date, confirmed, &config).await?;
+    record_daily_close_mark(&state, date, &closes)?;
     decide_for_latest(state, config, bundle, market, None).await
+}
+
+fn record_daily_close_mark(
+    state: &AppState,
+    date: NaiveDate,
+    closes: &BTreeMap<String, f64>,
+) -> Result<()> {
+    let now = Utc::now();
+    let (snapshot, persisted) = {
+        let mut engine = state.engine.lock();
+        for position in engine.positions() {
+            let base = base_symbol(&position.symbol)?;
+            let close = closes
+                .get(&base)
+                .with_context(|| format!("daily close is unavailable for held position {base}"))?;
+            engine.mark(&position.symbol, *close, now);
+        }
+        (engine.snapshot(now), engine.persistent_state())
+    };
+    let ledger = state.ledger.lock();
+    ledger.record_snapshot(&snapshot)?;
+    ledger.record_daily_snapshot(&date.to_string(), &snapshot)?;
+    ledger.save_engine_state(&persisted, now)?;
+    Ok(())
 }
 
 async fn repair_market_to(
@@ -1273,17 +1301,56 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn session(State(state): State<AppState>) -> Json<SessionView> {
+async fn session(
+    State(state): State<AppState>,
+) -> Result<Json<SessionView>, (axum::http::StatusCode, String)> {
     let engine = state.engine.lock();
     let runtime = state.runtime.lock().clone();
-    Json(SessionView {
+    let ledger = state.ledger.lock();
+    let intraday_max_drawdown = ledger
+        .session_performance(PAPER_SESSION_ID)
+        .map_err(|error| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read session performance: {error:#}"),
+            )
+        })?
+        .map(|performance| performance.max_drawdown)
+        .unwrap_or(0.0);
+    let daily_max_drawdown = ledger
+        .daily_max_drawdown(PAPER_SESSION_ID)
+        .map_err(|error| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read daily max drawdown: {error:#}"),
+            )
+        })?;
+    let session_start_equity_usd = ledger
+        .session_start_equity(PAPER_SESSION_ID)
+        .map_err(|error| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read session start equity: {error:#}"),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "session has no account snapshot".to_owned(),
+            )
+        })?;
+    drop(ledger);
+    Ok(Json(SessionView {
         status: runtime.status,
         detail: runtime.detail,
         model: state.model.clone(),
         account: engine.snapshot(Utc::now()),
+        session_start_equity_usd,
+        daily_max_drawdown,
+        intraday_max_drawdown,
         last_decision_date: runtime.last_decision_date,
         last_error: runtime.last_error,
-    })
+    }))
 }
 
 async fn positions(State(state): State<AppState>) -> Json<Vec<PositionView>> {
@@ -1328,7 +1395,7 @@ async fn executions(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn equity(State(state): State<AppState>) -> impl IntoResponse {
-    match state.ledger.lock().equity_curve(PAPER_SESSION_ID, 2_000) {
+    match state.ledger.lock().daily_equity_curve(PAPER_SESSION_ID) {
         Ok(points) => Json(points).into_response(),
         Err(error) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1344,9 +1411,24 @@ async fn replay_session(State(state): State<ReplayAppState>) -> Json<SessionView
         detail: "Deterministic 1D OOS replay; no network data, order book, or slippage.".to_owned(),
         model: state.model.clone(),
         account: state.account.clone(),
+        session_start_equity_usd: state.account.equity - state.account.realized_pnl,
+        daily_max_drawdown: max_drawdown(&state.equity),
+        intraday_max_drawdown: max_drawdown(&state.equity),
         last_decision_date: Some(state.last_decision_date.clone()),
         last_error: None,
     })
+}
+
+fn max_drawdown(points: &[EquityPoint]) -> f64 {
+    let mut peak = f64::NEG_INFINITY;
+    let mut maximum = 0.0_f64;
+    for point in points {
+        peak = peak.max(point.equity);
+        if peak > 0.0 {
+            maximum = maximum.min(point.equity / peak - 1.0);
+        }
+    }
+    maximum
 }
 
 async fn replay_positions() -> Json<Vec<PositionView>> {

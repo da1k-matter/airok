@@ -194,6 +194,8 @@ pub struct PaperState {
     pub session_id: String,
     pub cash: Usd,
     pub fee_paid: Usd,
+    #[serde(default)]
+    pub realized_pnl: Usd,
     pub positions: Vec<Position>,
 }
 

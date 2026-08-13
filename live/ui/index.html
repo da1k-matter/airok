@@ -24,20 +24,20 @@
         <div class="metric-group">
           <div class="metric"><span class="metric-label">Equity</span><strong id="equity">—</strong></div>
           <div class="metric metric-pnl"><span class="metric-label">Total P&amp;L</span><strong id="total-pnl">—</strong><span class="metric-detail" id="total-pnl-return">—</span></div>
-          <div class="metric"><span class="metric-label">Max drawdown</span><strong id="max-drawdown">—</strong></div>
-          <div class="metric"><span class="metric-label">Sharpe (daily)</span><strong id="sharpe">—</strong></div>
+          <div class="metric"><span class="metric-label">Max drawdown (daily close, all time)</span><strong id="max-drawdown">—</strong><span class="metric-detail" id="intraday-max-drawdown">Intraday: —</span></div>
+          <div class="metric"><span class="metric-label">Sharpe (closed UTC days)</span><strong id="sharpe">—</strong></div>
         </div>
         <div class="metric-group">
-          <div class="metric"><span class="metric-label">Profit factor (daily)</span><strong id="profit-factor">—</strong></div>
-          <div class="metric"><span class="metric-label">Win rate (daily)</span><strong id="win-rate">—</strong></div>
-          <div class="metric"><span class="metric-label">Average daily return</span><strong id="average-return">—</strong></div>
+          <div class="metric"><span class="metric-label">Profit factor (daily net P&amp;L)</span><strong id="profit-factor">—</strong></div>
+          <div class="metric"><span class="metric-label">Win rate (closed UTC days)</span><strong id="win-rate">—</strong></div>
+          <div class="metric"><span class="metric-label">Average return (closed UTC days)</span><strong id="average-return">—</strong></div>
           <div class="metric"><span class="metric-label">Fees paid</span><strong id="fees">—</strong></div>
         </div>
       </section>
 
       <nav class="main-nav" aria-label="Paper monitor sections">
         <button class="nav-button active" data-view="positions-view">Positions <span class="nav-count" id="position-count">0</span></button>
-        <button class="nav-button" data-view="trades-view">Trades <span class="nav-count" id="trade-count">0</span></button>
+        <button class="nav-button" data-view="trades-view">Executions <span class="nav-count" id="trade-count">0</span></button>
         <button class="nav-button" data-view="equity-view">Equity</button>
       </nav>
 
@@ -54,8 +54,8 @@
 
       <section class="view" id="trades-view" aria-labelledby="trades-title">
         <div class="section-top">
-          <div><h2 class="section-title" id="trades-title">Trade history</h2><p class="section-copy">Most recent paper execution reports, including actual L2-derived fill price, fees and observed slippage.</p></div>
-          <div class="section-meta">Latest 100 executions</div>
+          <div><h2 class="section-title" id="trades-title">Execution history</h2><p class="section-copy">Most recent paper execution reports, including filled and rejected orders, L2-derived prices, fees and observed slippage.</p></div>
+          <div class="section-meta">Latest 100 execution reports</div>
         </div>
         <div class="data-table-wrap">
           <table class="trades-table"><thead><tr><th><button type="button" class="sort-button" data-table="trades" data-sort-key="symbol">Instrument</button></th><th><button type="button" class="sort-button" data-table="trades" data-sort-key="side">Side</button></th><th class="num"><button type="button" class="sort-button" data-table="trades" data-sort-key="filled_quantity">Lot</button></th><th class="num"><button type="button" class="sort-button" data-table="trades" data-sort-key="vwap">Fill price</button></th><th class="num"><button type="button" class="sort-button" data-table="trades" data-sort-key="notional">Notional</button></th><th class="num"><button type="button" class="sort-button" data-table="trades" data-sort-key="fee">Fee</button></th><th class="num"><button type="button" class="sort-button" data-table="trades" data-sort-key="slippage_bps">Slippage</button></th><th><button type="button" class="sort-button" data-table="trades" data-sort-key="status">Status</button></th><th><button type="button" class="sort-button" data-table="trades" data-sort-key="executed_at">Executed</button></th><th><button type="button" class="sort-button" data-table="trades" data-sort-key="decision_id">Decision</button></th></tr></thead><tbody id="trades-body"></tbody></table>
@@ -65,7 +65,7 @@
 
       <section class="view" id="equity-view" aria-labelledby="equity-title">
         <div class="section-top">
-          <div><h2 class="section-title" id="equity-title">Equity curve</h2><p class="section-copy">Paper equity at each recorded account snapshot, inclusive of filled execution fees.</p></div>
+          <div><h2 class="section-title" id="equity-title">Equity curve</h2><p class="section-copy">One synchronized mark-to-market portfolio equity value at each confirmed UTC daily close, including realised and unrealised P&amp;L plus fees.</p></div>
           <div class="section-meta" id="equity-meta">Awaiting first close</div>
         </div>
         <div class="chart-wrap"><svg id="chart" aria-label="Equity curve"></svg><div id="chart-tooltip" class="chart-tooltip"></div></div>

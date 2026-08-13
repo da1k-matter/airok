@@ -39,6 +39,7 @@ pub struct PaperEngine {
     config: PaperConfig,
     cash: f64,
     fee_paid: f64,
+    realized_pnl: f64,
     positions: BTreeMap<String, Position>,
 }
 
@@ -64,6 +65,7 @@ impl PaperEngine {
             config,
             cash: config.initial_equity_usd,
             fee_paid: 0.0,
+            realized_pnl: 0.0,
             positions: BTreeMap::new(),
         })
     }
@@ -77,6 +79,7 @@ impl PaperEngine {
             session_id: self.session_id.clone(),
             cash: self.cash,
             fee_paid: self.fee_paid,
+            realized_pnl: self.realized_pnl,
             positions: self.positions(),
         }
     }
@@ -87,6 +90,7 @@ impl PaperEngine {
             || state.cash <= 0.0
             || !state.fee_paid.is_finite()
             || state.fee_paid < 0.0
+            || !state.realized_pnl.is_finite()
         {
             return Err(EngineError::InvalidConfig(
                 "invalid persisted paper state".to_owned(),
@@ -94,6 +98,7 @@ impl PaperEngine {
         }
         engine.cash = state.cash;
         engine.fee_paid = state.fee_paid;
+        engine.realized_pnl = state.realized_pnl;
         engine.positions = state
             .positions
             .into_iter()
@@ -116,11 +121,6 @@ impl PaperEngine {
             .values()
             .map(Position::unrealized_pnl)
             .sum::<f64>();
-        let realized_pnl = self
-            .positions
-            .values()
-            .map(|position| position.realized_pnl)
-            .sum::<f64>();
         let gross_notional = self.positions.values().map(Position::notional).sum::<f64>();
         let net_notional = self
             .positions
@@ -132,7 +132,7 @@ impl PaperEngine {
             captured_at: now,
             cash: self.cash,
             equity: self.cash + unrealized_pnl,
-            realized_pnl,
+            realized_pnl: self.realized_pnl,
             unrealized_pnl,
             gross_notional,
             net_notional,
@@ -295,8 +295,11 @@ impl PaperEngine {
             entry.quantity = new_quantity;
         } else {
             let closed_quantity = prior_quantity.abs().min(signed_fill.abs());
-            entry.realized_pnl +=
+            let realized_pnl =
                 (fill_price - entry.entry_vwap) * prior_quantity.signum() * closed_quantity;
+            entry.realized_pnl += realized_pnl;
+            self.cash += realized_pnl;
+            self.realized_pnl += realized_pnl;
             let remaining = prior_quantity + signed_fill;
             entry.quantity = remaining;
             if remaining.signum() != prior_quantity.signum() && remaining.abs() > EPSILON {
@@ -423,6 +426,38 @@ mod tests {
         assert!(report.fee > 0.0);
         assert_eq!(engine.positions().len(), 1);
         assert!(engine.snapshot(Utc::now()).equity < 1_000.0);
+    }
+
+    #[test]
+    fn closing_a_position_realizes_pnl_into_cash_and_equity() {
+        let mut engine = engine();
+        let rules = InstrumentRules {
+            symbol: "BTCUSDT".to_owned(),
+            status: "Trading".to_owned(),
+            contract_type: "LinearPerpetual".to_owned(),
+            qty_step: 0.001,
+            min_qty: 0.001,
+            min_notional_value: 5.0,
+            max_market_order_qty: 150.0,
+            tick_size: 0.1,
+        };
+        engine
+            .rebalance_to_notional("open", "BTCUSDT", 500.0, &rules, &book())
+            .expect("open works")
+            .expect("open trade is needed");
+        let mut closing_book = book();
+        closing_book.bids[0].price = 109.0;
+        closing_book.asks[0].price = 111.0;
+        engine
+            .rebalance_to_notional("close", "BTCUSDT", 0.0, &rules, &closing_book)
+            .expect("close works")
+            .expect("close trade is needed");
+
+        let snapshot = engine.snapshot(Utc::now());
+        assert!(engine.positions().is_empty());
+        assert!((snapshot.realized_pnl - 40.0).abs() < 1e-9);
+        assert!((snapshot.equity - snapshot.cash).abs() < 1e-9);
+        assert!(snapshot.equity > 1_000.0);
     }
 
     #[test]
