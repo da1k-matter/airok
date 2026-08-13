@@ -9,7 +9,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use futures_util::{StreamExt, stream};
 use parking_lot::Mutex;
 use rt_bybit::{BybitPublicClient, base_symbol, bybit_linear_symbol};
-use rt_domain::{AccountSnapshot, Candle};
+use rt_domain::{AccountSnapshot, Candle, InstrumentRules, OrderBookSnapshot};
 use rt_engine::{PaperConfig, PaperEngine, RiskLimits};
 use rt_execution::SnapshotExecutionConfig;
 use rt_ledger::{EquityPoint, Ledger};
@@ -86,6 +86,7 @@ struct BybitConfig {
 struct AppState {
     engine: Arc<Mutex<PaperEngine>>,
     ledger: Arc<Mutex<Ledger>>,
+    instrument_rules: Arc<Mutex<BTreeMap<String, InstrumentRules>>>,
     model: ModelView,
     runtime: Arc<Mutex<RuntimeStatus>>,
 }
@@ -141,7 +142,7 @@ struct PositionView {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (config_path, once, replay) = parse_arguments()?;
+    let (config_path, once, replay, bootstrap_previous_day) = parse_arguments()?;
     let config = load_config(&config_path)?;
     let address: SocketAddr = config.server.bind.parse().context("parse server.bind")?;
     if let Some(replay) = replay {
@@ -161,7 +162,13 @@ async fn main() -> Result<()> {
         .latest_decision_id()?
         .and_then(|id| id.strip_prefix("ranktrend-1d-").map(ToOwned::to_owned));
     let paper_config = paper_config(&config);
-    let engine = if let Some(state) = ledger.load_engine_state(PAPER_SESSION_ID)? {
+    let restored_state = ledger.load_engine_state(PAPER_SESSION_ID)?;
+    if bootstrap_previous_day && restored_state.is_some() {
+        bail!(
+            "--bootstrap-previous-day requires a fresh paper ledger; remove the existing local paper state first"
+        );
+    }
+    let engine = if let Some(state) = restored_state {
         PaperEngine::restore(paper_config, state)?
     } else {
         PaperEngine::new(PAPER_SESSION_ID.to_owned(), paper_config)?
@@ -171,6 +178,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         engine: Arc::new(Mutex::new(engine)),
         ledger: Arc::new(Mutex::new(ledger)),
+        instrument_rules: Arc::new(Mutex::new(BTreeMap::new())),
         model: ModelView {
             bundle_id: bundle.manifest.bundle_id,
             backend: bundle.manifest.backend,
@@ -184,10 +192,17 @@ async fn main() -> Result<()> {
         })),
     };
     if once {
-        run_bootstrap_and_decide(state.clone(), config).await?;
+        run_previous_day_bootstrap(state.clone(), config).await?;
         return Ok(());
     }
-    tokio::spawn(run_live_loop(state.clone(), config));
+    if !bootstrap_previous_day {
+        set_status(
+            &state,
+            "waiting_for_daily_close",
+            "Waiting for a confirmed 1D close. Use --bootstrap-previous-day only for a fresh paper session.",
+        );
+    }
+    tokio::spawn(run_live_loop(state.clone(), config, bootstrap_previous_day));
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/health", get(health))
@@ -230,7 +245,7 @@ struct ReplayRun {
     equity: Vec<EquityPoint>,
 }
 
-fn parse_arguments() -> Result<(PathBuf, bool, Option<ReplayRequest>)> {
+fn parse_arguments() -> Result<(PathBuf, bool, Option<ReplayRequest>, bool)> {
     let mut config = PathBuf::from("config/paper.toml");
     let mut once = false;
     let mut replay_start = None;
@@ -238,6 +253,7 @@ fn parse_arguments() -> Result<(PathBuf, bool, Option<ReplayRequest>)> {
     let mut replay_bundle = None;
     let mut warmup_bundle = None;
     let mut reference = None;
+    let mut bootstrap_previous_day = false;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -245,6 +261,7 @@ fn parse_arguments() -> Result<(PathBuf, bool, Option<ReplayRequest>)> {
                 config = PathBuf::from(arguments.next().context("missing --config path")?)
             }
             "--once" => once = true,
+            "--bootstrap-previous-day" => bootstrap_previous_day = true,
             "--replay-start" => {
                 replay_start = Some(NaiveDate::parse_from_str(
                     &arguments.next().context("missing --replay-start date")?,
@@ -293,7 +310,10 @@ fn parse_arguments() -> Result<(PathBuf, bool, Option<ReplayRequest>)> {
     if replay.is_some() && once {
         bail!("--once cannot be combined with historical replay")
     }
-    Ok((config, once, replay))
+    if replay.is_some() && bootstrap_previous_day {
+        bail!("--bootstrap-previous-day cannot be combined with historical replay")
+    }
+    Ok((config, once, replay, bootstrap_previous_day))
 }
 
 fn paper_config(config: &RuntimeConfig) -> PaperConfig {
@@ -310,9 +330,11 @@ fn paper_config(config: &RuntimeConfig) -> PaperConfig {
     }
 }
 
-async fn run_live_loop(state: AppState, config: RuntimeConfig) {
-    if let Err(error) = run_bootstrap_and_decide(state.clone(), config.clone()).await {
-        set_error(&state, error);
+async fn run_live_loop(state: AppState, config: RuntimeConfig, bootstrap_previous_day: bool) {
+    if bootstrap_previous_day {
+        if let Err(error) = run_previous_day_bootstrap(state.clone(), config.clone()).await {
+            set_error(&state, error);
+        }
     }
     loop {
         let client = BybitPublicClient::default();
@@ -459,11 +481,11 @@ async fn collect_confirmed_daily_batch(
         .collect()
 }
 
-async fn run_bootstrap_and_decide(state: AppState, config: RuntimeConfig) -> Result<()> {
+async fn run_previous_day_bootstrap(state: AppState, config: RuntimeConfig) -> Result<()> {
     set_status(
         &state,
         "validating",
-        "Checking model contracts and rebuilding causal daily state.",
+        "Bootstrapping one previous confirmed UTC day into a fresh paper session.",
     );
     let bundle = inspect_bundle(&config.model.bundle)?;
     let mut market = load_daily_csv_panel(&config.data.directory)?;
@@ -474,6 +496,14 @@ async fn run_bootstrap_and_decide(state: AppState, config: RuntimeConfig) -> Res
         .date_naive()
         .pred_opt()
         .context("cannot determine latest confirmed UTC day")?;
+    let local_last = market
+        .dates
+        .last()
+        .copied()
+        .context("local market panel is empty")?;
+    if local_last > yesterday {
+        bail!("local history extends beyond the previous confirmed UTC day {yesterday}");
+    }
     repair_market_to(&mut market, &bundle, yesterday, Vec::new(), &config).await?;
     decide_for_latest(state, config, bundle, market).await
 }
@@ -641,24 +671,15 @@ async fn decide_for_latest(
         desired.entry(position.symbol).or_insert(0.0);
     }
     let client = BybitPublicClient::default();
-    for (symbol, notional) in desired {
-        let rules = match client.instrument_rules(&symbol).await {
-            Ok(rules) => rules,
-            Err(error) => {
-                eprintln!("skip {symbol}: instrument constraints unavailable: {error:#}");
-                continue;
-            }
-        };
-        let book = match client
-            .orderbook(&symbol, config.bybit.orderbook_depth)
-            .await
-        {
-            Ok(book) => book,
-            Err(error) => {
-                eprintln!("skip {symbol}: order-book snapshot unavailable: {error:#}");
-                continue;
-            }
-        };
+    let execution_inputs = fetch_execution_inputs(
+        &client,
+        desired,
+        &state.instrument_rules,
+        config.bybit.orderbook_depth,
+        config.bybit.rest_parallelism,
+    )
+    .await;
+    for (symbol, notional, rules, book) in execution_inputs {
         if book.mid_price().is_none() {
             eprintln!("skip {symbol}: order-book snapshot is not two-sided");
             continue;
@@ -692,6 +713,53 @@ async fn decide_for_latest(
     runtime.last_decision_date = Some(date.to_string());
     runtime.last_error = None;
     Ok(())
+}
+
+async fn fetch_execution_inputs(
+    client: &BybitPublicClient,
+    desired: BTreeMap<String, f64>,
+    rules_cache: &Arc<Mutex<BTreeMap<String, InstrumentRules>>>,
+    orderbook_depth: u16,
+    parallelism: usize,
+) -> Vec<(String, f64, InstrumentRules, OrderBookSnapshot)> {
+    let inputs = stream::iter(desired)
+        .map(|(symbol, notional)| {
+            let client = client.clone();
+            let rules_cache = Arc::clone(rules_cache);
+            async move {
+                let cached_rules = { rules_cache.lock().get(&symbol).cloned() };
+                let rules = match cached_rules {
+                    Some(rules) => rules,
+                    None => match client.instrument_rules(&symbol).await {
+                        Ok(rules) => {
+                            rules_cache.lock().insert(symbol.clone(), rules.clone());
+                            rules
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "skip {symbol}: instrument constraints unavailable: {error:#}"
+                            );
+                            return None;
+                        }
+                    },
+                };
+                let book = match client.orderbook(&symbol, orderbook_depth).await {
+                    Ok(book) => book,
+                    Err(error) => {
+                        eprintln!("skip {symbol}: order-book snapshot unavailable: {error:#}");
+                        return None;
+                    }
+                };
+                Some((symbol, notional, rules, book))
+            }
+        })
+        .buffer_unordered(parallelism.max(1))
+        .filter_map(|input| async move { input })
+        .collect::<Vec<_>>()
+        .await;
+    let mut inputs = inputs;
+    inputs.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    inputs
 }
 
 async fn run_historical_replay(

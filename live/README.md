@@ -28,6 +28,16 @@ Open `http://127.0.0.1:8789`. Readiness is confirmed by `GET /health` and the de
 
 The default runtime configuration reads the shared historical candle directory at `../trainer/data/1d` for bootstrap only. It writes no research artifacts there. Change `[data].directory` if the deployed service maintains its own market-history store.
 
+### First paper-session bootstrap
+
+For a brand-new paper session, use the explicit bootstrap flag once. It rebuilds any missing causal OHLCV history when needed, but creates exactly one paper decision: from yesterday's confirmed UTC candle. It then waits for subsequent 1D closes through WebSocket; no paper trades are backfilled for missed days.
+
+```bash
+cargo run --release -p ranktrend-paper -- --config config/paper.toml --bootstrap-previous-day
+```
+
+Do not use this flag after a paper ledger already exists: the regular launch restores the ledger and only waits for the next confirmed close.
+
 ## Historical OOS parity replay
 
 This short, isolated mode verifies Rust against an existing Python backtest over one complete 56-day walk-forward block. It uses local OHLCV only: no Bybit connection, order book, slippage, or live-paper ledger state. The previous fold is used only for the 21-day smoothing warm-up.
