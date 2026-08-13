@@ -11,31 +11,27 @@
   <body>
     <main class="workspace">
       <header class="appbar">
-        <a class="brand" href="/"><span class="brand-mark">ranktrend</span><span class="brand-sub">Paper monitor</span></a>
+        <a class="brand" href="/"><span class="brand-mark">ranktrend</span></a>
         <div class="app-status"><span class="status-pulse" id="live-dot"></span><span id="status">Connecting</span><span class="last-updated" id="last-updated"></span></div>
       </header>
 
       <section class="brief" aria-labelledby="page-title">
-        <p class="kicker" id="mode-label">Cross-sectional ranking / paper execution</p>
+        <p class="kicker" id="mode-label">Cross-sectional crypto ranking</p>
         <h1 id="page-title">RankTrend Live</h1>
-        <p class="run-line" id="run-line">Loading the paper session.</p>
-        <div class="venue-list" aria-label="Execution venue"><span class="venue-tag">Bybit linear</span><span class="venue-tag">Daily close</span></div>
       </section>
 
       <section class="metrics" aria-label="Session and performance metrics">
         <div class="metric-group">
           <div class="metric"><span class="metric-label">Equity</span><strong id="equity">—</strong></div>
-          <div class="metric"><span class="metric-label">Cash</span><strong id="cash">—</strong></div>
-          <div class="metric"><span class="metric-label">Gross exposure</span><strong id="gross">—</strong></div>
-          <div class="metric"><span class="metric-label">Net exposure</span><strong id="net">—</strong></div>
-          <div class="metric"><span class="metric-label">Model cut-off</span><strong id="cutoff">—</strong></div>
+          <div class="metric"><span class="metric-label">Total P&amp;L</span><strong id="total-pnl">—</strong></div>
+          <div class="metric"><span class="metric-label">Max drawdown</span><strong id="max-drawdown">—</strong></div>
+          <div class="metric"><span class="metric-label">Sharpe (daily)</span><strong id="sharpe">—</strong></div>
         </div>
         <div class="metric-group">
-          <div class="metric"><span class="metric-label">Realized P&amp;L</span><strong id="realized">—</strong></div>
-          <div class="metric"><span class="metric-label">Unrealized P&amp;L</span><strong id="unrealized">—</strong></div>
+          <div class="metric"><span class="metric-label">Profit factor (daily)</span><strong id="profit-factor">—</strong></div>
+          <div class="metric"><span class="metric-label">Win rate (daily)</span><strong id="win-rate">—</strong></div>
+          <div class="metric"><span class="metric-label">Average daily return</span><strong id="average-return">—</strong></div>
           <div class="metric"><span class="metric-label">Fees paid</span><strong id="fees">—</strong></div>
-          <div class="metric"><span class="metric-label">Open positions</span><strong id="position-metric">—</strong></div>
-          <div class="metric"><span class="metric-label">Recorded trades</span><strong id="trade-metric">—</strong></div>
         </div>
       </section>
 

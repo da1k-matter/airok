@@ -34,6 +34,13 @@ pub fn execute_snapshot_sweep(
     if request.symbol != book.symbol || request.symbol != rules.symbol {
         return Ok(rejected(request, book, "instrument mismatch"));
     }
+    if !rules.is_tradable_linear_perpetual() {
+        return Ok(rejected(
+            request,
+            book,
+            "instrument is not a tradable Bybit linear perpetual",
+        ));
+    }
 
     let requested_quantity = round_down(request.quantity, rules.qty_step);
     if requested_quantity < rules.min_qty {
@@ -43,11 +50,29 @@ pub fn execute_snapshot_sweep(
             "quantity is below the Bybit minimum",
         ));
     }
+    if requested_quantity > rules.max_market_order_qty {
+        return Ok(rejected(
+            request,
+            book,
+            "quantity exceeds the Bybit market-order maximum",
+        ));
+    }
 
     let mut levels = match request.side {
         Side::Buy => sorted_levels(&book.asks, false),
         Side::Sell => sorted_levels(&book.bids, true),
     };
+    let reference_price = levels
+        .first()
+        .map(|level| level.price)
+        .filter(|price| price.is_finite() && *price > 0.0);
+    if reference_price.is_none_or(|price| requested_quantity * price < rules.min_notional_value) {
+        return Ok(rejected(
+            request,
+            book,
+            "rounded order notional is below the Bybit minimum",
+        ));
+    }
     let mut remaining = requested_quantity;
     let mut filled_quantity = 0.0;
     let mut notional = 0.0;
@@ -89,6 +114,13 @@ pub fn execute_snapshot_sweep(
             } else {
                 "insufficient snapshot liquidity; partial fills are disabled"
             },
+        ));
+    }
+    if notional < rules.min_notional_value {
+        return Ok(rejected(
+            request,
+            book,
+            "filled order notional is below the Bybit minimum",
         ));
     }
 
@@ -163,7 +195,9 @@ fn round_down(value: f64, step: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use rt_domain::{ExecutionRequest, InstrumentRules, OrderBookSnapshot, PriceLevel, Side};
+    use rt_domain::{
+        ExecutionRequest, FillStatus, InstrumentRules, OrderBookSnapshot, PriceLevel, Side,
+    };
 
     use super::{SnapshotExecutionConfig, execute_snapshot_sweep};
 
@@ -201,8 +235,12 @@ mod tests {
             },
             &InstrumentRules {
                 symbol: "BTCUSDT".to_owned(),
+                status: "Trading".to_owned(),
+                contract_type: "LinearPerpetual".to_owned(),
                 qty_step: 0.1,
                 min_qty: 0.1,
+                min_notional_value: 5.0,
+                max_market_order_qty: 10.0,
                 tick_size: 0.1,
             },
             &book(),
@@ -216,5 +254,80 @@ mod tests {
         assert_eq!(report.consumed_levels.len(), 2);
         assert!((report.vwap.expect("vwap") - (0.5 * 101.0 + 102.0) / 1.5).abs() < 1e-10);
         assert!(report.slippage_bps.expect("slippage") > 0.0);
+    }
+
+    #[test]
+    fn rejects_a_quantity_that_rounds_below_minimum_notional() {
+        let report = execute_snapshot_sweep(
+            &ExecutionRequest {
+                decision_id: "d2".to_owned(),
+                symbol: "BTCUSDT".to_owned(),
+                side: Side::Buy,
+                quantity: 0.049,
+                requested_at: Utc::now(),
+            },
+            &InstrumentRules {
+                symbol: "BTCUSDT".to_owned(),
+                status: "Trading".to_owned(),
+                contract_type: "LinearPerpetual".to_owned(),
+                qty_step: 0.01,
+                min_qty: 0.01,
+                min_notional_value: 5.0,
+                max_market_order_qty: 10.0,
+                tick_size: 0.1,
+            },
+            &book(),
+            SnapshotExecutionConfig {
+                fee_bps: 10.0,
+                reject_partial: true,
+            },
+        )
+        .expect("execution succeeds");
+        assert_eq!(report.status, FillStatus::Rejected);
+        assert_eq!(
+            report.rejection_reason.as_deref(),
+            Some("rounded order notional is below the Bybit minimum")
+        );
+    }
+
+    #[test]
+    fn rejects_non_trading_and_oversized_market_orders() {
+        let request = ExecutionRequest {
+            decision_id: "d3".to_owned(),
+            symbol: "BTCUSDT".to_owned(),
+            side: Side::Buy,
+            quantity: 1.0,
+            requested_at: Utc::now(),
+        };
+        let mut rules = InstrumentRules {
+            symbol: "BTCUSDT".to_owned(),
+            status: "PreLaunch".to_owned(),
+            contract_type: "LinearPerpetual".to_owned(),
+            qty_step: 0.01,
+            min_qty: 0.01,
+            min_notional_value: 5.0,
+            max_market_order_qty: 0.5,
+            tick_size: 0.1,
+        };
+        let config = SnapshotExecutionConfig {
+            fee_bps: 10.0,
+            reject_partial: true,
+        };
+        let unavailable =
+            execute_snapshot_sweep(&request, &rules, &book(), config).expect("execution succeeds");
+        assert_eq!(unavailable.status, FillStatus::Rejected);
+        assert_eq!(
+            unavailable.rejection_reason.as_deref(),
+            Some("instrument is not a tradable Bybit linear perpetual")
+        );
+
+        rules.status = "Trading".to_owned();
+        let oversized =
+            execute_snapshot_sweep(&request, &rules, &book(), config).expect("execution succeeds");
+        assert_eq!(oversized.status, FillStatus::Rejected);
+        assert_eq!(
+            oversized.rejection_reason.as_deref(),
+            Some("quantity exceeds the Bybit market-order maximum")
+        );
     }
 }

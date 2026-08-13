@@ -86,9 +86,15 @@ struct BybitConfig {
 struct AppState {
     engine: Arc<Mutex<PaperEngine>>,
     ledger: Arc<Mutex<Ledger>>,
-    instrument_rules: Arc<Mutex<BTreeMap<String, InstrumentRules>>>,
+    instrument_rules: Arc<Mutex<InstrumentRuleCache>>,
     model: ModelView,
     runtime: Arc<Mutex<RuntimeStatus>>,
+}
+
+#[derive(Default)]
+struct InstrumentRuleCache {
+    refreshed_for: Option<NaiveDate>,
+    rules: BTreeMap<String, InstrumentRules>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -179,7 +185,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         engine: Arc::new(Mutex::new(engine)),
         ledger: Arc::new(Mutex::new(ledger)),
-        instrument_rules: Arc::new(Mutex::new(BTreeMap::new())),
+        instrument_rules: Arc::new(Mutex::new(InstrumentRuleCache::default())),
         model: ModelView {
             bundle_id: bundle.manifest.bundle_id,
             backend: bundle.manifest.backend,
@@ -345,7 +351,12 @@ async fn run_live_loop(state: AppState, config: RuntimeConfig, bootstrap_previou
     }
     loop {
         let client = BybitPublicClient::default();
-        let symbols = match subscription_symbols(&client, &config).await {
+        if let Err(error) = refresh_instrument_rules(&state, &client).await {
+            set_error(&state, error);
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            continue;
+        }
+        let symbols = match subscription_symbols(&state, &config) {
             Ok(symbols) => symbols,
             Err(error) => {
                 set_error(&state, error);
@@ -503,22 +514,20 @@ async fn record_open_position_mark(state: &AppState, candle: Candle) -> Result<(
     Ok(())
 }
 
-async fn subscription_symbols(
-    client: &BybitPublicClient,
-    config: &RuntimeConfig,
-) -> Result<Vec<String>> {
+fn subscription_symbols(state: &AppState, config: &RuntimeConfig) -> Result<Vec<String>> {
     let bundle = inspect_bundle(&config.model.bundle)?;
-    let active = client
-        .active_linear_symbols()
-        .await?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let rules = state.instrument_rules.lock();
     let symbols = bundle
         .universe
         .symbols
         .iter()
         .map(|base| bybit_linear_symbol(base))
-        .filter(|symbol| active.contains(symbol))
+        .filter(|symbol| {
+            rules
+                .rules
+                .get(symbol)
+                .is_some_and(InstrumentRules::is_tradable_linear_perpetual)
+        })
         .collect::<Vec<_>>();
     if symbols.is_empty() {
         bail!("none of the immutable model-universe contracts are currently tradable on Bybit");
@@ -740,20 +749,30 @@ async fn decide_for_latest(
         let mut scorer = NativeScorer::load(&bundle)?;
         scorer.target_weights(&market)?
     };
+    let client = BybitPublicClient::default();
+    refresh_instrument_rules(&state, &client).await?;
     let equity = state.engine.lock().snapshot(Utc::now()).equity;
     let mut desired = BTreeMap::<String, f64>::new();
     for (base, weight) in market.symbols.iter().zip(target) {
         if weight.abs() > 1e-10 {
-            desired.insert(
-                bybit_linear_symbol(base),
-                weight * equity * config.paper.gross_leverage,
-            );
+            let symbol = bybit_linear_symbol(base);
+            if is_tradable(&state.instrument_rules, &symbol) {
+                desired.insert(symbol, weight * equity * config.paper.gross_leverage);
+            } else {
+                eprintln!("skip {symbol}: unavailable or not a Trading Bybit linear perpetual");
+            }
         }
     }
     for position in state.engine.lock().positions() {
-        desired.entry(position.symbol).or_insert(0.0);
+        if is_tradable(&state.instrument_rules, &position.symbol) {
+            desired.entry(position.symbol).or_insert(0.0);
+        } else {
+            eprintln!(
+                "cannot reduce {}: current Bybit instrument rules are unavailable",
+                position.symbol
+            );
+        }
     }
-    let client = BybitPublicClient::default();
     let execution_inputs = fetch_execution_inputs(
         &client,
         desired,
@@ -798,10 +817,34 @@ async fn decide_for_latest(
     Ok(())
 }
 
+async fn refresh_instrument_rules(state: &AppState, client: &BybitPublicClient) -> Result<()> {
+    let today = Utc::now().date_naive();
+    if state.instrument_rules.lock().refreshed_for == Some(today) {
+        return Ok(());
+    }
+    let rules = client.linear_instrument_rules().await?;
+    if rules.is_empty() {
+        bail!("Bybit returned an empty linear instrument rule snapshot");
+    }
+    *state.instrument_rules.lock() = InstrumentRuleCache {
+        refreshed_for: Some(today),
+        rules,
+    };
+    Ok(())
+}
+
+fn is_tradable(rules: &Arc<Mutex<InstrumentRuleCache>>, symbol: &str) -> bool {
+    rules
+        .lock()
+        .rules
+        .get(symbol)
+        .is_some_and(InstrumentRules::is_tradable_linear_perpetual)
+}
+
 async fn fetch_execution_inputs(
     client: &BybitPublicClient,
     desired: BTreeMap<String, f64>,
-    rules_cache: &Arc<Mutex<BTreeMap<String, InstrumentRules>>>,
+    rules_cache: &Arc<Mutex<InstrumentRuleCache>>,
     orderbook_depth: u16,
     parallelism: usize,
 ) -> Vec<(String, f64, InstrumentRules, OrderBookSnapshot)> {
@@ -810,21 +853,12 @@ async fn fetch_execution_inputs(
             let client = client.clone();
             let rules_cache = Arc::clone(rules_cache);
             async move {
-                let cached_rules = { rules_cache.lock().get(&symbol).cloned() };
-                let rules = match cached_rules {
-                    Some(rules) => rules,
-                    None => match client.instrument_rules(&symbol).await {
-                        Ok(rules) => {
-                            rules_cache.lock().insert(symbol.clone(), rules.clone());
-                            rules
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "skip {symbol}: instrument constraints unavailable: {error:#}"
-                            );
-                            return None;
-                        }
-                    },
+                let rules = match rules_cache.lock().rules.get(&symbol).cloned() {
+                    Some(rules) if rules.is_tradable_linear_perpetual() => rules,
+                    _ => {
+                        eprintln!("skip {symbol}: instrument is unavailable or not tradable");
+                        return None;
+                    }
                 };
                 let book = match client.orderbook(&symbol, orderbook_depth).await {
                     Ok(book) => book,

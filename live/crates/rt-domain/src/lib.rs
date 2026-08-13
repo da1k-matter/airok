@@ -88,9 +88,19 @@ impl OrderBookSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstrumentRules {
     pub symbol: String,
+    pub status: String,
+    pub contract_type: String,
     pub qty_step: Quantity,
     pub min_qty: Quantity,
+    pub min_notional_value: Usd,
+    pub max_market_order_qty: Quantity,
     pub tick_size: Price,
+}
+
+impl InstrumentRules {
+    pub fn is_tradable_linear_perpetual(&self) -> bool {
+        self.status == "Trading" && self.contract_type == "LinearPerpetual"
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

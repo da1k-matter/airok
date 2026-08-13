@@ -8,6 +8,7 @@ const slippage = value => Number.isFinite(value) ? `${value >= 0 ? '+' : ''}${Nu
 const classFor = value => value > 0 ? 'pos' : value < 0 ? 'neg' : '';
 const escapeHtml = value => String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#039;');
 const timestamp = value => value ? new Date(value).toLocaleString([], { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : '—';
+const percent = value => Number.isFinite(value) ? `${value >= 0 ? '+' : ''}${(value * 100).toFixed(2)}%` : '—';
 let latestEquity = [];
 let latestPositions = [];
 let latestTrades = [];
@@ -78,13 +79,52 @@ function sortRows(rows, table) {
   });
 }
 
+function closedDailyEquity(rows) {
+  const today = new Date().toISOString().slice(0, 10), byDate = new Map();
+  rows.forEach(row => {
+    const date = row.captured_at.slice(0, 10);
+    if (date < today) byDate.set(date, row.equity);
+  });
+  return [...byDate.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, equity]) => equity);
+}
+
+function performanceMetrics(rows, currentEquity) {
+  if (!rows.length) return {};
+  const initial = rows[0].equity, totalPnl = currentEquity - initial, totalReturn = initial ? totalPnl / initial : null;
+  let peak = -Infinity, maxDrawdown = 0;
+  rows.forEach(row => { peak = Math.max(peak, row.equity); if (peak > 0) maxDrawdown = Math.min(maxDrawdown, row.equity / peak - 1); });
+  const dailyEquity = closedDailyEquity(rows), returns = dailyEquity.slice(1).map((value, index) => value / dailyEquity[index] - 1).filter(Number.isFinite);
+  if (returns.length < 2) return { totalPnl, totalReturn, maxDrawdown };
+  const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
+  const variance = returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (returns.length - 1);
+  const losses = returns.filter(value => value < 0), gains = returns.filter(value => value > 0);
+  return {
+    totalPnl, totalReturn, maxDrawdown,
+    sharpe: variance > 0 ? mean / Math.sqrt(variance) * Math.sqrt(365) : null,
+    profitFactor: losses.length && gains.length ? gains.reduce((sum, value) => sum + value, 0) / Math.abs(losses.reduce((sum, value) => sum + value, 0)) : null,
+    winRate: gains.length + losses.length ? gains.length / (gains.length + losses.length) : null,
+    averageReturn: mean,
+  };
+}
+
+function renderPerformance(rows, equity) {
+  const metrics = performanceMetrics(rows, equity);
+  const set = (id, value, className = '') => { const element = document.querySelector(id); element.textContent = value; element.className = className; };
+  set('#total-pnl', Number.isFinite(metrics.totalPnl) ? `${signedMoney(metrics.totalPnl)} · ${percent(metrics.totalReturn)}` : '—', classFor(metrics.totalPnl));
+  set('#max-drawdown', Number.isFinite(metrics.maxDrawdown) ? percent(metrics.maxDrawdown) : '—', metrics.maxDrawdown < 0 ? 'neg' : '');
+  set('#sharpe', Number.isFinite(metrics.sharpe) ? metrics.sharpe.toFixed(2) : '—', classFor(metrics.sharpe));
+  set('#profit-factor', Number.isFinite(metrics.profitFactor) ? metrics.profitFactor.toFixed(2) : '—', classFor((metrics.profitFactor ?? 1) - 1));
+  set('#win-rate', Number.isFinite(metrics.winRate) ? `${(metrics.winRate * 100).toFixed(1)}%` : '—', classFor((metrics.winRate ?? .5) - .5));
+  set('#average-return', percent(metrics.averageReturn), classFor(metrics.averageReturn));
+}
+
 function renderPositions(rows, executions, equity) {
   latestPositions = rows;
   const latestSlippage = new Map();
   executions.forEach(row => { if (!latestSlippage.has(row.symbol)) latestSlippage.set(row.symbol, row.slippage_bps); });
   const preparedRows = rows.map(row => ({ ...row, lot_pct: equity > 0 ? row.notional / equity * 100 : 0, slippage_bps: latestSlippage.get(row.symbol) }));
   const sortedRows = sortRows(preparedRows, 'positions');
-  document.querySelector('#position-count').textContent = rows.length.toLocaleString(); document.querySelector('#position-metric').textContent = rows.length.toLocaleString(); document.querySelector('#positions-meta').textContent = rows.length ? `${rows.length} active instruments` : 'No active positions';
+  document.querySelector('#position-count').textContent = rows.length.toLocaleString(); document.querySelector('#positions-meta').textContent = rows.length ? `${rows.length} active instruments` : 'No active positions';
   document.querySelector('#positions-body').innerHTML = sortedRows.map(row => `<tr><td class="symbol">${escapeHtml(row.symbol)}</td><td><span class="side side-${escapeHtml(row.side)}">${escapeHtml(row.side)}</span></td><td class="num">${row.lot_pct.toFixed(2)}%</td><td class="num">${money(row.notional)}</td><td class="num">${price(row.entry_price)}</td><td class="num">${price(row.mark_price)}</td><td class="num ${classFor(row.unrealized_pnl)}">${signedMoney(row.unrealized_pnl)}</td><td class="num warn">${slippage(row.slippage_bps)}</td><td>${timestamp(row.opened_at)}</td></tr>`).join('');
   document.querySelector('#positions-empty').style.display = rows.length ? 'none' : 'block';
   renderSortIndicators('positions');
@@ -93,7 +133,7 @@ function renderPositions(rows, executions, equity) {
 function renderTrades(rows) {
   latestTrades = rows;
   const sortedRows = sortRows(rows, 'trades');
-  document.querySelector('#trade-count').textContent = rows.length.toLocaleString(); document.querySelector('#trade-metric').textContent = rows.length.toLocaleString();
+  document.querySelector('#trade-count').textContent = rows.length.toLocaleString();
   document.querySelector('#trades-body').innerHTML = sortedRows.map(row => `<tr><td class="symbol">${escapeHtml(row.symbol)}</td><td><span class="side side-${escapeHtml(row.side)}">${escapeHtml(row.side)}</span></td><td class="num">${quantity.format(row.filled_quantity)}</td><td class="num">${price(row.vwap)}</td><td class="num">${money(row.notional)}</td><td class="num warn">${money(row.fee)}</td><td class="num warn">${slippage(row.slippage_bps)}</td><td class="${row.status === 'filled' ? 'pos' : row.status === 'rejected' ? 'neg' : 'warn'}">${escapeHtml(row.status)}</td><td>${timestamp(row.executed_at)}</td><td>${escapeHtml(row.decision_id)}</td></tr>`).join('');
   document.querySelector('#trades-empty').style.display = rows.length ? 'none' : 'block';
   renderSortIndicators('trades');
@@ -103,9 +143,9 @@ async function refresh() {
   try {
     const [session, positions, equity, executions] = await Promise.all(['/api/session', '/api/positions', '/api/equity', '/api/executions'].map(url => fetch(url, { cache: 'no-store' }).then(response => { if (!response.ok) throw new Error(`${url} unavailable`); return response.json(); })));
     const account = session.account, replay = session.status === 'historical_replay';
-    document.querySelector('#live-dot').classList.remove('offline'); document.querySelector('#status').textContent = session.status.replaceAll('_', ' ').toUpperCase(); document.querySelector('#last-updated').textContent = '3s refresh'; document.querySelector('#mode-label').textContent = replay ? 'Historical OOS replay / frozen model' : 'Cross-sectional ranking / paper execution'; document.querySelector('#run-line').textContent = `${replay ? 'Replay' : 'Live paper'} · Bybit linear · 1D confirmed closes · ${session.detail}`;
-    document.querySelector('#equity').textContent = money(account.equity); document.querySelector('#cash').textContent = money(account.cash); document.querySelector('#gross').textContent = money(account.gross_notional); document.querySelector('#net').textContent = signedMoney(account.net_notional); document.querySelector('#net').className = classFor(account.net_notional); document.querySelector('#cutoff').textContent = session.model.cutoff_date; document.querySelector('#realized').textContent = signedMoney(account.realized_pnl); document.querySelector('#realized').className = classFor(account.realized_pnl); document.querySelector('#unrealized').textContent = signedMoney(account.unrealized_pnl); document.querySelector('#unrealized').className = classFor(account.unrealized_pnl); document.querySelector('#fees').textContent = money(account.fee_paid); document.querySelector('#equity-meta').textContent = session.last_decision_date || 'Awaiting first close'; document.querySelector('#model-info').textContent = `Frozen ${session.model.backend.toUpperCase()} ensemble · h${session.model.horizon_days} · ${session.model.seed_count} seeds · cut-off ${session.model.cutoff_date}`;
-    currentEquity = account.equity; latestEquity = equity; renderTrades(executions); renderPositions(positions, executions, currentEquity); if (document.querySelector('#equity-view').classList.contains('active')) drawChart(equity);
+    document.querySelector('#live-dot').classList.remove('offline'); document.querySelector('#status').textContent = session.status.replaceAll('_', ' ').toUpperCase(); document.querySelector('#last-updated').textContent = '3s refresh'; document.querySelector('#mode-label').textContent = replay ? 'Historical OOS replay / frozen model' : 'Cross-sectional crypto ranking';
+    document.querySelector('#equity').textContent = money(account.equity); document.querySelector('#fees').textContent = money(account.fee_paid); document.querySelector('#equity-meta').textContent = session.last_decision_date || 'Awaiting first close'; document.querySelector('#model-info').textContent = `Frozen ${session.model.backend.toUpperCase()} ensemble · h${session.model.horizon_days} · ${session.model.seed_count} seeds · cut-off ${session.model.cutoff_date}`;
+    currentEquity = account.equity; latestEquity = equity; renderPerformance(equity, currentEquity); renderTrades(executions); renderPositions(positions, executions, currentEquity); if (document.querySelector('#equity-view').classList.contains('active')) drawChart(equity);
   } catch (_) { document.querySelector('#live-dot').classList.add('offline'); document.querySelector('#status').textContent = 'API UNAVAILABLE'; document.querySelector('#last-updated').textContent = 'Retrying'; }
 }
 refresh(); setInterval(refresh, 3000); window.addEventListener('resize', () => { if (document.querySelector('#equity-view').classList.contains('active')) drawChart(latestEquity); });

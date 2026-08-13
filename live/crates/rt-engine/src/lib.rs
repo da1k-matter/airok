@@ -158,10 +158,17 @@ impl PaperEngine {
             .map_or(0.0, |position| position.quantity);
         let target_quantity = target_notional / mark;
         let delta = target_quantity - current_quantity;
-        if delta.abs() < rules.min_qty {
+        let rounded_delta = round_down(delta.abs(), rules.qty_step);
+        if rounded_delta <= EPSILON {
             return Ok(None);
         }
-        let projected_gross = self.projected_gross_notional(symbol, target_quantity, mark);
+        let proposed_quantity = current_quantity
+            + if delta > 0.0 {
+                rounded_delta
+            } else {
+                -rounded_delta
+            };
+        let projected_gross = self.projected_gross_notional(symbol, proposed_quantity, mark);
         let maximum = self.snapshot(book.captured_at).equity * self.config.risk.max_gross_leverage;
         if projected_gross > maximum + EPSILON {
             return Err(EngineError::GrossLeverageExceeded {
@@ -174,7 +181,7 @@ impl PaperEngine {
             decision_id: decision_id.to_owned(),
             symbol: symbol.to_owned(),
             side,
-            quantity: delta.abs(),
+            quantity: rounded_delta,
             requested_at: book.captured_at,
         };
         let report = execute_snapshot_sweep(&request, rules, book, self.config.execution)?;
@@ -246,6 +253,10 @@ impl PaperEngine {
     }
 }
 
+fn round_down(value: f64, step: f64) -> f64 {
+    (value / step + 1e-10).floor() * step
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -298,8 +309,12 @@ mod tests {
                 500.0,
                 &InstrumentRules {
                     symbol: "BTCUSDT".to_owned(),
+                    status: "Trading".to_owned(),
+                    contract_type: "LinearPerpetual".to_owned(),
                     qty_step: 0.001,
                     min_qty: 0.001,
+                    min_notional_value: 5.0,
+                    max_market_order_qty: 150.0,
                     tick_size: 0.1,
                 },
                 &book(),

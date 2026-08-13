@@ -74,83 +74,41 @@ impl BybitPublicClient {
         })
     }
 
-    /// Retrieve the immutable order-size and tick constraints used by the paper executor.
-    pub async fn instrument_rules(&self, symbol: &str) -> Result<rt_domain::InstrumentRules> {
-        let url = format!("{}/v5/market/instruments-info", self.rest_url);
-        let payload: ApiEnvelope<InstrumentsResult> = self
-            .http
-            .get(url)
-            .query(&[("category", "linear"), ("symbol", symbol)])
-            .send()
-            .await
-            .context("request Bybit instrument rules")?
-            .error_for_status()
-            .context("Bybit instrument rules HTTP status")?
-            .json()
-            .await
-            .context("decode Bybit instrument rules")?;
-        ensure_success(&payload)?;
-        let result = payload
-            .result
-            .context("Bybit instrument rules response missing result")?;
-        let instrument = result
-            .list
-            .into_iter()
-            .find(|instrument| instrument.symbol == symbol)
-            .with_context(|| format!("Bybit has no linear instrument {symbol}"))?;
-        Ok(rt_domain::InstrumentRules {
-            symbol: instrument.symbol,
-            qty_step: instrument
-                .lot_size_filter
-                .qty_step
-                .parse()
-                .context("parse Bybit qty step")?,
-            min_qty: instrument
-                .lot_size_filter
-                .min_order_qty
-                .parse()
-                .context("parse Bybit minimum order quantity")?,
-            tick_size: instrument
-                .price_filter
-                .tick_size
-                .parse()
-                .context("parse Bybit tick size")?,
-        })
-    }
-
-    /// List the currently tradable USDT linear contracts for safe WebSocket subscription.
-    pub async fn active_linear_symbols(&self) -> Result<Vec<String>> {
+    /// Fetch the complete current Bybit linear-instrument rule set for one daily decision.
+    pub async fn linear_instrument_rules(
+        &self,
+    ) -> Result<BTreeMap<String, rt_domain::InstrumentRules>> {
         let url = format!("{}/v5/market/instruments-info", self.rest_url);
         let mut cursor: Option<String> = None;
-        let mut symbols = Vec::new();
+        let mut rules = BTreeMap::new();
         loop {
-            let mut request = self.http.get(&url).query(&[
-                ("category", "linear"),
-                ("status", "Trading"),
-                ("limit", "1000"),
-            ]);
+            let mut request = self
+                .http
+                .get(&url)
+                .query(&[("category", "linear"), ("limit", "1000")]);
             if let Some(value) = &cursor {
                 request = request.query(&[("cursor", value)]);
             }
-            let payload: ApiEnvelope<ActiveInstrumentsResult> = request
+            let payload: ApiEnvelope<InstrumentsResult> = request
                 .send()
                 .await
-                .context("request active Bybit linear instruments")?
+                .context("request Bybit instrument rules")?
                 .error_for_status()
-                .context("Bybit active instruments HTTP status")?
+                .context("Bybit instrument rules HTTP status")?
                 .json()
                 .await
-                .context("decode active Bybit linear instruments")?;
+                .context("decode Bybit instrument rules")?;
             ensure_success(&payload)?;
             let result = payload
                 .result
-                .context("Bybit active instruments response missing result")?;
-            symbols.extend(result.list.into_iter().map(|instrument| instrument.symbol));
+                .context("Bybit instrument rules response missing result")?;
+            for instrument in result.list {
+                let rule = to_instrument_rule(instrument)?;
+                rules.insert(rule.symbol.clone(), rule);
+            }
             cursor = result.next_page_cursor.filter(|value| !value.is_empty());
             if cursor.is_none() {
-                symbols.sort();
-                symbols.dedup();
-                return Ok(symbols);
+                return Ok(rules);
             }
         }
     }
@@ -416,23 +374,16 @@ struct KlineResult {
 #[derive(Debug, Deserialize)]
 struct InstrumentsResult {
     list: Vec<InstrumentInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ActiveInstrumentsResult {
-    list: Vec<ActiveInstrumentInfo>,
     #[serde(rename = "nextPageCursor")]
     next_page_cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ActiveInstrumentInfo {
-    symbol: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct InstrumentInfo {
     symbol: String,
+    status: String,
+    #[serde(rename = "contractType")]
+    contract_type: String,
     #[serde(rename = "lotSizeFilter")]
     lot_size_filter: LotSizeFilter,
     #[serde(rename = "priceFilter")]
@@ -445,12 +396,49 @@ struct LotSizeFilter {
     qty_step: String,
     #[serde(rename = "minOrderQty")]
     min_order_qty: String,
+    #[serde(rename = "minNotionalValue")]
+    min_notional_value: String,
+    #[serde(rename = "maxMktOrderQty")]
+    max_market_order_qty: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct PriceFilter {
     #[serde(rename = "tickSize")]
     tick_size: String,
+}
+
+fn to_instrument_rule(instrument: InstrumentInfo) -> Result<rt_domain::InstrumentRules> {
+    Ok(rt_domain::InstrumentRules {
+        symbol: instrument.symbol,
+        status: instrument.status,
+        contract_type: instrument.contract_type,
+        qty_step: instrument
+            .lot_size_filter
+            .qty_step
+            .parse()
+            .context("parse Bybit qty step")?,
+        min_qty: instrument
+            .lot_size_filter
+            .min_order_qty
+            .parse()
+            .context("parse Bybit minimum order quantity")?,
+        min_notional_value: instrument
+            .lot_size_filter
+            .min_notional_value
+            .parse()
+            .context("parse Bybit minimum notional value")?,
+        max_market_order_qty: instrument
+            .lot_size_filter
+            .max_market_order_qty
+            .parse()
+            .context("parse Bybit maximum market order quantity")?,
+        tick_size: instrument
+            .price_filter
+            .tick_size
+            .parse()
+            .context("parse Bybit tick size")?,
+    })
 }
 
 fn ensure_success<T>(response: &ApiEnvelope<T>) -> Result<()> {
