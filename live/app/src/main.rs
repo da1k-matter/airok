@@ -600,8 +600,8 @@ async fn run_previous_day_bootstrap(state: AppState, config: RuntimeConfig) -> R
     if local_last > yesterday {
         bail!("local history extends beyond the previous confirmed UTC day {yesterday}");
     }
-    repair_market_to(&mut market, &bundle, yesterday, Vec::new(), &config).await?;
-    let bootstrap_closes = refresh_bootstrap_day(&mut market, &bundle, yesterday, &config).await?;
+    let bootstrap_closes =
+        repair_market_to(&mut market, &bundle, yesterday, Vec::new(), &config).await?;
     decide_for_latest(state, config, bundle, market, Some(bootstrap_closes)).await
 }
 
@@ -623,54 +623,20 @@ async fn handle_confirmed_close(
     decide_for_latest(state, config, bundle, market, None).await
 }
 
-/// Fetch the bootstrap day again for every model asset. These exact candles both
-/// replace the last in-memory feature row and provide the only permitted entry
-/// anchors for a first paper session.
-async fn refresh_bootstrap_day(
-    market: &mut MarketPanel,
-    bundle: &BundleMetadata,
-    date: NaiveDate,
-    config: &RuntimeConfig,
-) -> Result<BTreeMap<String, f64>> {
-    let client = BybitPublicClient::default();
-    let candles = fetch_daily_range(
-        &client,
-        &bundle.universe.symbols,
-        date,
-        date,
-        config.bybit.rest_parallelism,
-    )
-    .await
-    .into_iter()
-    .filter(|candle| candle.opened_at.date_naive() == date)
-    .collect::<Vec<_>>();
-    if !candles.iter().any(|candle| candle.symbol == "BTC") {
-        bail!("cannot bootstrap {date}: confirmed BTC candle is unavailable");
-    }
-    merge_confirmed_daily_candles(market, &candles)?;
-    Ok(candles
-        .into_iter()
-        .filter_map(|candle| {
-            (candle.close.is_finite() && candle.close > 0.0)
-                .then_some((candle.symbol, candle.close))
-        })
-        .collect())
-}
-
 async fn repair_market_to(
     market: &mut MarketPanel,
     bundle: &BundleMetadata,
     target: NaiveDate,
     supplied: Vec<Candle>,
     config: &RuntimeConfig,
-) -> Result<()> {
+) -> Result<BTreeMap<String, f64>> {
     let last = market
         .dates
         .last()
         .copied()
         .context("local market panel is empty")?;
     if target <= last {
-        return Ok(());
+        return Ok(closes_for_market_date(market, target));
     }
     let start = last.succ_opt().context("daily date overflow")?;
     let client = BybitPublicClient::default();
@@ -711,15 +677,40 @@ async fn repair_market_to(
         candles.extend(supplied);
     }
     let mut date = start;
+    let mut target_closes = BTreeMap::new();
     while date <= target {
         let candles = by_date.remove(&date).unwrap_or_default();
         if !candles.iter().any(|candle| candle.symbol == "BTC") {
             bail!("cannot repair {date}: confirmed BTC candle is unavailable");
         }
+        if date == target {
+            target_closes = candles
+                .iter()
+                .filter_map(|candle| {
+                    (candle.close.is_finite() && candle.close > 0.0)
+                        .then_some((candle.symbol.clone(), candle.close))
+                })
+                .collect();
+        }
         merge_confirmed_daily_candles(market, &candles)?;
         date = date.succ_opt().context("daily date overflow")?;
     }
-    Ok(())
+    Ok(target_closes)
+}
+
+fn closes_for_market_date(market: &MarketPanel, date: NaiveDate) -> BTreeMap<String, f64> {
+    let Some(row) = market.dates.iter().position(|candidate| *candidate == date) else {
+        return BTreeMap::new();
+    };
+    market
+        .symbols
+        .iter()
+        .enumerate()
+        .filter_map(|(column, symbol)| {
+            let close = f64::from(market.close.get(row, column));
+            (close.is_finite() && close > 0.0).then_some((symbol.clone(), close))
+        })
+        .collect()
 }
 
 async fn fetch_daily_range(
