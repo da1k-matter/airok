@@ -13,6 +13,9 @@ let latestEquity = [];
 let latestPositions = [];
 let latestTrades = [];
 let currentEquity = 0;
+let latestMetrics = {};
+let totalEquityPoints = 0;
+let nextCurveRefresh = 0;
 const sorting = {
   positions: { key: 'symbol', direction: 'asc' },
   trades: { key: 'executed_at', direction: 'desc' },
@@ -33,32 +36,31 @@ document.querySelectorAll('.sort-button').forEach(button => button.addEventListe
   if (table === 'trades') renderTrades(latestTrades);
 }));
 
-function chartFrame(svg) {
-  const { width, height } = svg.getBoundingClientRect();
+function chartFrame(canvas) {
+  const { width, height } = canvas.getBoundingClientRect(), ratio = Math.min(window.devicePixelRatio || 1, 2);
   const W = Math.max(width, 1), H = Math.max(height, 1), L = W * .075, R = W * .03, T = H * .08, B = H * .13;
-  svg.setAttribute('viewBox', `0 0 ${W} ${H}`); svg.innerHTML = '';
-  return { W, H, L, R, T, B, plotW: W - L - R, plotH: H - T - B };
+  canvas.width = Math.round(W * ratio); canvas.height = Math.round(H * ratio);
+  const context = canvas.getContext('2d'); context.setTransform(ratio, 0, 0, ratio, 0, 0); context.clearRect(0, 0, W, H);
+  return { context, W, H, L, R, T, B, plotW: W - L - R, plotH: H - T - B };
 }
 
 function drawChart(rows) {
-  const svg = document.querySelector('#chart'), tip = document.querySelector('#chart-tooltip');
-  const { W, H, L, R, T, B, plotW, plotH } = chartFrame(svg);
+  const canvas = document.querySelector('#chart'), tip = document.querySelector('#chart-tooltip');
+  const { context, W, H, L, R, T, B, plotW, plotH } = chartFrame(canvas);
   if (!rows.length) { tip.style.opacity = '0'; return; }
-  const values = rows.map(row => row.equity), initial = values[0], current = values.at(-1);
-  if (rows.length < 2 || new Set(rows.map(row => row.captured_at.slice(0, 10))).size < 2) {
-    const y = T + plotH / 2, lx = L + 120, rx = W - R - 120, delta = current - initial;
-    svg.innerHTML = `<line class="chart-grid" x1="${L}" y1="${y}" x2="${W - R}" y2="${y}"/><text class="chart-axis-label" x="${L}" y="${T + 24}">BOOTSTRAP COMPLETE — FIRST DAILY MARK PENDING</text><text class="chart-axis-label" x="${lx}" y="${y - 26}" text-anchor="middle">STARTING EQUITY</text><text fill="#f4ede4" x="${lx}" y="${y + 7}" text-anchor="middle" font-size="24" font-weight="700">${money(initial)}</text><line class="chart-line" x1="${lx + 105}" y1="${y}" x2="${rx - 105}" y2="${y}"/><circle class="chart-marker" cx="${lx + 105}" cy="${y}" r="4"/><circle class="chart-marker" cx="${rx - 105}" cy="${y}" r="4"/><text class="chart-axis-label" x="${rx}" y="${y - 26}" text-anchor="middle">CURRENT AFTER ENTRY FEES</text><text fill="#d99647" x="${rx}" y="${y + 7}" text-anchor="middle" font-size="24" font-weight="700">${money(current)}</text><text class="chart-axis-label" x="${W / 2}" y="${y + 38}" text-anchor="middle">${signedMoney(delta)} · ${(initial ? delta / initial * 100 : 0).toFixed(3)}%</text><text class="chart-axis-label" x="${L}" y="${H - 15}">${rows[0].captured_at.slice(0, 10)}</text><text class="chart-axis-label" x="${W - R}" y="${H - 15}" text-anchor="end">NEXT CONFIRMED 1D CLOSE ADDS THE FIRST CURVE POINT</text>`;
-    tip.style.opacity = '0'; return;
-  }
-  const low = Math.min(...values), high = Math.max(...values), pad = Math.max((high - low) * .12, Math.abs(initial) * .0025), min = low - pad, max = high + pad, range = max - min;
-  const x = index => L + index / (rows.length - 1) * plotW, y = value => T + (max - value) / range * plotH;
-  let markup = '<defs><linearGradient id="equity-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#d99647" stop-opacity=".28"/><stop offset="100%" stop-color="#d99647" stop-opacity="0"/></linearGradient></defs>';
-  for (let index = 0; index < 5; index += 1) { const value = min + range * index / 4, yy = y(value); markup += `<line class="chart-grid" x1="${L}" y1="${yy}" x2="${W - R}" y2="${yy}"/><text class="chart-axis-label" x="${L - 12}" y="${yy + 4}" text-anchor="end">${money(value)}</text>`; }
-  for (const index of [...new Set([0, Math.floor((rows.length - 1) / 2), rows.length - 1])]) { const anchor = index === 0 ? 'start' : index === rows.length - 1 ? 'end' : 'middle'; markup += `<text class="chart-axis-label" x="${x(index)}" y="${H - 15}" text-anchor="${anchor}">${rows[index].captured_at.slice(0, 10)}</text>`; }
-  const points = values.map((value, index) => `${x(index)},${y(value)}`).join(' ');
-  svg.innerHTML = `${markup}<polygon class="chart-area" points="${L},${T + plotH} ${points} ${W - R},${T + plotH}"/><polyline class="chart-line" points="${points}"/><circle class="chart-marker" cx="${x(0)}" cy="${y(values[0])}" r="4"/><circle class="chart-marker" cx="${x(values.length - 1)}" cy="${y(values.at(-1))}" r="4"/><line id="chart-crosshair" class="chart-crosshair" x1="${L}" y1="${T}" x2="${L}" y2="${T + plotH}" opacity="0"/><circle id="chart-hover-dot" class="chart-marker" cx="${L}" cy="${T}" r="4" opacity="0"/>`;
-  svg.onmousemove = event => { const rect = svg.getBoundingClientRect(), raw = (event.clientX - rect.left) / rect.width, index = Math.max(0, Math.min(rows.length - 1, Math.round((raw * W - L) / plotW))), row = rows[index], cx = x(index), cy = y(row.equity); const crosshair = svg.querySelector('#chart-crosshair'), dot = svg.querySelector('#chart-hover-dot'); crosshair.setAttribute('x1', cx); crosshair.setAttribute('x2', cx); crosshair.setAttribute('opacity', '1'); dot.setAttribute('cx', cx); dot.setAttribute('cy', cy); dot.setAttribute('opacity', '1'); tip.innerHTML = `${row.captured_at.slice(0, 10)}<br><strong>${money(row.equity)}</strong>`; tip.style.left = `${Math.max(72, Math.min(W - 72, cx)) / W * 100}%`; tip.style.top = `${Math.max(42, cy) / H * 100}%`; tip.style.opacity = '1'; };
-  svg.onmouseleave = () => { svg.querySelector('#chart-crosshair').setAttribute('opacity', '0'); svg.querySelector('#chart-hover-dot').setAttribute('opacity', '0'); tip.style.opacity = '0'; };
+  const lows = rows.map(row => row.low), highs = rows.map(row => row.high), initial = rows[0].equity;
+  const low = Math.min(...lows), high = Math.max(...highs), pad = Math.max((high - low) * .12, Math.abs(initial) * .0025), min = low - pad, max = high + pad, range = max - min;
+  const x = index => L + index / Math.max(rows.length - 1, 1) * plotW, y = value => T + (max - value) / range * plotH;
+  context.strokeStyle = '#29211d'; context.fillStyle = '#7e7068'; context.font = '11px ui-monospace, monospace'; context.lineWidth = 1;
+  for (let index = 0; index < 5; index += 1) { const value = min + range * index / 4, yy = y(value); context.beginPath(); context.moveTo(L, yy); context.lineTo(W - R, yy); context.stroke(); context.textAlign = 'right'; context.fillText(money(value), L - 12, yy + 4); }
+  context.strokeStyle = 'rgba(217, 150, 71, .34)'; context.lineWidth = 1;
+  rows.forEach((row, index) => { if (row.high !== row.low) { context.beginPath(); context.moveTo(x(index), y(row.low)); context.lineTo(x(index), y(row.high)); context.stroke(); } });
+  const gradient = context.createLinearGradient(0, T, 0, T + plotH); gradient.addColorStop(0, 'rgba(217,150,71,.28)'); gradient.addColorStop(1, 'rgba(217,150,71,0)');
+  context.beginPath(); context.moveTo(x(0), T + plotH); rows.forEach((row, index) => context.lineTo(x(index), y(row.equity))); context.lineTo(x(rows.length - 1), T + plotH); context.closePath(); context.fillStyle = gradient; context.fill();
+  context.beginPath(); rows.forEach((row, index) => index ? context.lineTo(x(index), y(row.equity)) : context.moveTo(x(index), y(row.equity))); context.strokeStyle = '#d99647'; context.lineWidth = 2.25; context.stroke();
+  context.fillStyle = '#7e7068'; context.textAlign = 'left'; context.fillText(timestamp(rows[0].captured_at), L, H - 15); context.textAlign = 'center'; context.fillText(`${totalEquityPoints.toLocaleString()} stored minute points`, W / 2, H - 15); context.textAlign = 'right'; context.fillText(timestamp(rows.at(-1).captured_at), W - R, H - 15);
+  canvas.onmousemove = event => { const rect = canvas.getBoundingClientRect(), index = Math.max(0, Math.min(rows.length - 1, Math.round(((event.clientX - rect.left - L) / plotW) * (rows.length - 1)))), row = rows[index], cx = x(index), cy = y(row.equity); tip.innerHTML = `${timestamp(row.captured_at)}<br><strong>${money(row.equity)}</strong>${row.low !== row.high ? `<br>${money(row.low)} — ${money(row.high)}` : ''}`; tip.style.left = `${Math.max(72, Math.min(W - 72, cx)) / W * 100}%`; tip.style.top = `${Math.max(42, cy) / H * 100}%`; tip.style.opacity = '1'; };
+  canvas.onmouseleave = () => { tip.style.opacity = '0'; };
 }
 
 function renderSortIndicators(table) {
@@ -79,34 +81,16 @@ function sortRows(rows, table) {
   });
 }
 
-function performanceMetrics(rows, currentEquity, initialEquity) {
-  const totalPnl = currentEquity - initialEquity, totalReturn = initialEquity ? totalPnl / initialEquity : null;
-  if (!rows.length) return { totalPnl, totalReturn };
-  const dailyEquity = rows.map(row => row.equity), dailyPnl = dailyEquity.slice(1).map((value, index) => value - dailyEquity[index]).filter(Number.isFinite), returns = dailyEquity.slice(1).map((value, index) => value / dailyEquity[index] - 1).filter(Number.isFinite);
-  if (!returns.length) return { totalPnl, totalReturn };
-  const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
-  const variance = returns.length > 1 ? returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (returns.length - 1) : null;
-  const losses = dailyPnl.filter(value => value < 0), gains = dailyPnl.filter(value => value > 0);
-  return {
-    totalPnl, totalReturn,
-    sharpe: variance > 0 ? mean / Math.sqrt(variance) * Math.sqrt(365) : null,
-    profitFactor: losses.length && gains.length ? gains.reduce((sum, value) => sum + value, 0) / Math.abs(losses.reduce((sum, value) => sum + value, 0)) : null,
-    winRate: gains.length + losses.length ? gains.length / (gains.length + losses.length) : null,
-    averageReturn: mean,
-  };
-}
-
-function renderPerformance(rows, equity, initialEquity, dailyMaxDrawdown, intradayMaxDrawdown) {
-  const metrics = performanceMetrics(rows, equity, initialEquity);
+function renderPerformance(equity, initialEquity, metrics) {
+  const totalPnl = equity - initialEquity, totalReturn = initialEquity ? totalPnl / initialEquity : null;
   const set = (id, value, className = '') => { const element = document.querySelector(id); element.textContent = value; element.className = className; };
-  set('#total-pnl', Number.isFinite(metrics.totalPnl) ? signedMoney(metrics.totalPnl) : '—', classFor(metrics.totalPnl));
-  set('#total-pnl-return', Number.isFinite(metrics.totalReturn) ? `${percent(metrics.totalReturn)} since inception` : '—', classFor(metrics.totalReturn));
-  set('#max-drawdown', Number.isFinite(dailyMaxDrawdown) ? percent(dailyMaxDrawdown) : '—', dailyMaxDrawdown < 0 ? 'neg' : '');
-  set('#intraday-max-drawdown', Number.isFinite(intradayMaxDrawdown) ? `Intraday: ${percent(intradayMaxDrawdown)}` : 'Intraday: —', intradayMaxDrawdown < 0 ? 'neg' : '');
+  set('#total-pnl', Number.isFinite(totalPnl) ? signedMoney(totalPnl) : '—', classFor(totalPnl));
+  set('#total-pnl-return', Number.isFinite(totalReturn) ? `${percent(totalReturn)} since inception` : '—', classFor(totalReturn));
+  set('#max-drawdown', Number.isFinite(metrics.max_drawdown) ? percent(metrics.max_drawdown) : '—', classFor(metrics.max_drawdown));
   set('#sharpe', Number.isFinite(metrics.sharpe) ? metrics.sharpe.toFixed(2) : '—', classFor(metrics.sharpe));
-  set('#profit-factor', Number.isFinite(metrics.profitFactor) ? metrics.profitFactor.toFixed(2) : '—', classFor((metrics.profitFactor ?? 1) - 1));
-  set('#win-rate', Number.isFinite(metrics.winRate) ? `${(metrics.winRate * 100).toFixed(1)}%` : '—', classFor((metrics.winRate ?? .5) - .5));
-  set('#average-return', percent(metrics.averageReturn), classFor(metrics.averageReturn));
+  set('#profit-factor', Number.isFinite(metrics.profit_factor) ? metrics.profit_factor.toFixed(2) : '—', classFor((metrics.profit_factor ?? 1) - 1));
+  set('#win-rate', Number.isFinite(metrics.win_rate) ? `${(metrics.win_rate * 100).toFixed(1)}%` : '—', classFor((metrics.win_rate ?? .5) - .5));
+  set('#average-return', Number.isFinite(metrics.average_return) ? percent(metrics.average_return) : '—', classFor(metrics.average_return));
 }
 
 function renderPositions(rows, executions, equity) {
@@ -132,11 +116,17 @@ function renderTrades(rows) {
 
 async function refresh() {
   try {
-    const [session, positions, equity, executions] = await Promise.all(['/api/session', '/api/positions', '/api/equity', '/api/executions'].map(url => fetch(url, { cache: 'no-store' }).then(response => { if (!response.ok) throw new Error(`${url} unavailable`); return response.json(); })));
+    const now = Date.now(), shouldRefreshCurve = now >= nextCurveRefresh;
+    const curveUrl = `/api/equity?max_points=${Math.max(400, Math.min(5000, Math.ceil(window.innerWidth * 2)))}`;
+    const urls = ['/api/session', '/api/positions', '/api/executions'];
+    if (shouldRefreshCurve) urls.push(curveUrl);
+    const payloads = await Promise.all(urls.map(url => fetch(url, { cache: 'no-store' }).then(response => { if (!response.ok) throw new Error(`${url} unavailable`); return response.json(); })));
+    const [session, positions, executions, curve] = payloads;
+    if (curve) { latestEquity = curve.points; latestMetrics = curve.metrics; totalEquityPoints = curve.total_points; nextCurveRefresh = now + 15000; }
     const account = session.account, replay = session.status === 'historical_replay';
     document.querySelector('#live-dot').classList.remove('offline'); document.querySelector('#status').textContent = session.status.replaceAll('_', ' ').toUpperCase(); document.querySelector('#last-updated').textContent = '3s refresh'; document.querySelector('#mode-label').textContent = replay ? 'Historical OOS replay / frozen model' : 'Cross-sectional crypto ranking';
     document.querySelector('#equity').textContent = money(account.equity); document.querySelector('#fees').textContent = money(account.fee_paid); document.querySelector('#equity-meta').textContent = session.last_decision_date || 'Awaiting first close'; document.querySelector('#model-info').textContent = `Frozen ${session.model.backend.toUpperCase()} ensemble · h${session.model.horizon_days} · ${session.model.seed_count} seeds · cut-off ${session.model.cutoff_date}`;
-    currentEquity = account.equity; latestEquity = equity; renderPerformance(equity, currentEquity, session.session_start_equity_usd, session.daily_max_drawdown, session.intraday_max_drawdown); renderTrades(executions); renderPositions(positions, executions, currentEquity); if (document.querySelector('#equity-view').classList.contains('active')) drawChart(equity);
+    currentEquity = account.equity; renderPerformance(currentEquity, session.session_start_equity_usd, latestMetrics); renderTrades(executions); renderPositions(positions, executions, currentEquity); if (curve && document.querySelector('#equity-view').classList.contains('active')) drawChart(latestEquity);
   } catch (_) { document.querySelector('#live-dot').classList.add('offline'); document.querySelector('#status').textContent = 'API UNAVAILABLE'; document.querySelector('#last-updated').textContent = 'Retrying'; }
 }
 refresh(); setInterval(refresh, 3000); window.addEventListener('resize', () => { if (document.querySelector('#equity-view').classList.contains('active')) drawChart(latestEquity); });

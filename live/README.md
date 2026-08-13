@@ -28,6 +28,12 @@ Open `http://127.0.0.1:8789`. Readiness is confirmed by `GET /health` and the de
 
 The default runtime configuration reads the shared historical candle directory at `../train/data/1d` for bootstrap only. It writes no research artifacts there. Change `[data].directory` if the deployed service maintains its own market-history store.
 
+### Performance history
+
+The ledger keeps one latest mark-to-market equity point for every observed UTC minute without a retention limit. Maximum drawdown is updated from every incoming mark, including multiple symbol updates inside the same minute. The dashboard requests only enough extrema-preserving time buckets for the current canvas width, so long histories remain inexpensive to transfer and render while the complete minute series stays in SQLite.
+
+Sharpe and average return use consecutive minute equity returns. Profit factor and win rate use net P&L from closed position quantities, including allocated entry and exit fees; they are not derived from daily account P&L.
+
 ### First paper-session bootstrap
 
 For a brand-new paper session, the default launch automatically bootstraps exactly one paper decision from yesterday's confirmed UTC candle. It rebuilds missing causal OHLCV history when needed, sizes and records each entry from that candle's close, and applies only the current order book's executable impact from the best quote to the fill VWAP. It then waits for subsequent 1D closes through WebSocket. No paper trades are backfilled for missed days.

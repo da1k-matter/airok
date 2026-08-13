@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     response::{Html, IntoResponse},
     routing::get,
 };
@@ -12,7 +12,7 @@ use rt_bybit::{BybitPublicClient, base_symbol, bybit_linear_symbol};
 use rt_domain::{AccountSnapshot, Candle, InstrumentRules, OrderBookSnapshot};
 use rt_engine::{PaperConfig, PaperEngine, RiskLimits};
 use rt_execution::SnapshotExecutionConfig;
-use rt_ledger::{EquityPoint, Ledger};
+use rt_ledger::{EquityBucket, EquityCurve, EquityPoint, Ledger, PerformanceMetrics};
 use rt_model::{BundleMetadata, LightGbmLibrary, NativeBooster, inspect_bundle};
 use rt_panel::{
     FeaturePanel, MarketPanel, build_features, load_daily_csv_panel, merge_confirmed_daily_candles,
@@ -132,8 +132,6 @@ struct SessionView {
     model: ModelView,
     account: AccountSnapshot,
     session_start_equity_usd: f64,
-    daily_max_drawdown: f64,
-    intraday_max_drawdown: f64,
     last_decision_date: Option<String>,
     last_error: Option<String>,
 }
@@ -516,7 +514,7 @@ async fn record_open_position_mark(state: &AppState, candle: Candle) -> Result<(
         (engine.snapshot(now), engine.persistent_state())
     };
     let ledger = state.ledger.lock();
-    ledger.record_snapshot(&snapshot)?;
+    ledger.record_equity_point(&snapshot)?;
     ledger.save_engine_state(&persisted, now)?;
     Ok(())
 }
@@ -623,15 +621,11 @@ async fn handle_confirmed_close(
         .map(|candle| candle.opened_at.date_naive())
         .context("confirmed daily candle batch is empty")?;
     let closes = repair_market_to(&mut market, &bundle, date, confirmed, &config).await?;
-    record_daily_close_mark(&state, date, &closes)?;
+    record_confirmed_close_mark(&state, &closes)?;
     decide_for_latest(state, config, bundle, market, None).await
 }
 
-fn record_daily_close_mark(
-    state: &AppState,
-    date: NaiveDate,
-    closes: &BTreeMap<String, f64>,
-) -> Result<()> {
+fn record_confirmed_close_mark(state: &AppState, closes: &BTreeMap<String, f64>) -> Result<()> {
     let now = Utc::now();
     let (snapshot, persisted) = {
         let mut engine = state.engine.lock();
@@ -646,7 +640,6 @@ fn record_daily_close_mark(
     };
     let ledger = state.ledger.lock();
     ledger.record_snapshot(&snapshot)?;
-    ledger.record_daily_snapshot(&date.to_string(), &snapshot)?;
     ledger.save_engine_state(&persisted, now)?;
     Ok(())
 }
@@ -1307,24 +1300,6 @@ async fn session(
     let engine = state.engine.lock();
     let runtime = state.runtime.lock().clone();
     let ledger = state.ledger.lock();
-    let intraday_max_drawdown = ledger
-        .session_performance(PAPER_SESSION_ID)
-        .map_err(|error| {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("read session performance: {error:#}"),
-            )
-        })?
-        .map(|performance| performance.max_drawdown)
-        .unwrap_or(0.0);
-    let daily_max_drawdown = ledger
-        .daily_max_drawdown(PAPER_SESSION_ID)
-        .map_err(|error| {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("read daily max drawdown: {error:#}"),
-            )
-        })?;
     let session_start_equity_usd = ledger
         .session_start_equity(PAPER_SESSION_ID)
         .map_err(|error| {
@@ -1346,8 +1321,6 @@ async fn session(
         model: state.model.clone(),
         account: engine.snapshot(Utc::now()),
         session_start_equity_usd,
-        daily_max_drawdown,
-        intraday_max_drawdown,
         last_decision_date: runtime.last_decision_date,
         last_error: runtime.last_error,
     }))
@@ -1394,8 +1367,21 @@ async fn executions(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn equity(State(state): State<AppState>) -> impl IntoResponse {
-    match state.ledger.lock().daily_equity_curve(PAPER_SESSION_ID) {
+#[derive(Debug, Deserialize)]
+struct EquityQuery {
+    max_points: Option<usize>,
+}
+
+async fn equity(
+    Query(query): Query<EquityQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let max_points = query.max_points.unwrap_or(2_000).clamp(200, 5_000);
+    match state
+        .ledger
+        .lock()
+        .equity_curve(PAPER_SESSION_ID, max_points)
+    {
         Ok(points) => Json(points).into_response(),
         Err(error) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1412,8 +1398,6 @@ async fn replay_session(State(state): State<ReplayAppState>) -> Json<SessionView
         model: state.model.clone(),
         account: state.account.clone(),
         session_start_equity_usd: state.account.equity - state.account.realized_pnl,
-        daily_max_drawdown: max_drawdown(&state.equity),
-        intraday_max_drawdown: max_drawdown(&state.equity),
         last_decision_date: Some(state.last_decision_date.clone()),
         last_error: None,
     })
@@ -1439,8 +1423,47 @@ async fn replay_executions() -> Json<Vec<rt_domain::ExecutionReport>> {
     Json(Vec::new())
 }
 
-async fn replay_equity(State(state): State<ReplayAppState>) -> Json<Vec<EquityPoint>> {
-    Json(state.equity.clone())
+async fn replay_equity(State(state): State<ReplayAppState>) -> Json<EquityCurve> {
+    let returns = state
+        .equity
+        .windows(2)
+        .filter_map(|pair| (pair[0].equity > 0.0).then_some(pair[1].equity / pair[0].equity - 1.0))
+        .collect::<Vec<_>>();
+    let average_return =
+        (!returns.is_empty()).then(|| returns.iter().sum::<f64>() / returns.len() as f64);
+    let sharpe = average_return.and_then(|mean| {
+        (returns.len() > 1)
+            .then(|| {
+                let variance = returns
+                    .iter()
+                    .map(|value| (value - mean).powi(2))
+                    .sum::<f64>()
+                    / (returns.len() - 1) as f64;
+                (variance > 0.0).then(|| mean / variance.sqrt() * 365.0_f64.sqrt())
+            })
+            .flatten()
+    });
+    Json(EquityCurve {
+        total_points: state.equity.len(),
+        points: state
+            .equity
+            .iter()
+            .map(|point| EquityBucket {
+                captured_at: point.captured_at,
+                equity: point.equity,
+                low: point.equity,
+                high: point.equity,
+            })
+            .collect(),
+        metrics: PerformanceMetrics {
+            max_drawdown: max_drawdown(&state.equity),
+            sharpe,
+            average_return,
+            profit_factor: None,
+            win_rate: None,
+            closed_trades: 0,
+        },
+    })
 }
 
 async fn dashboard() -> Html<&'static str> {

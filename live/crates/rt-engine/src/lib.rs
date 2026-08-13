@@ -244,7 +244,7 @@ impl PaperEngine {
                 self.config.execution.fee_bps,
             )?;
         }
-        self.apply_execution(&report, position_opened_at.unwrap_or(book.captured_at));
+        self.apply_execution(&mut report, position_opened_at.unwrap_or(book.captured_at));
         Ok(Some(report))
     }
 
@@ -266,7 +266,7 @@ impl PaperEngine {
             }
     }
 
-    fn apply_execution(&mut self, report: &ExecutionReport, now: DateTime<Utc>) {
+    fn apply_execution(&mut self, report: &mut ExecutionReport, now: DateTime<Utc>) {
         if matches!(report.status, FillStatus::Rejected) || report.filled_quantity <= EPSILON {
             return;
         }
@@ -283,6 +283,7 @@ impl PaperEngine {
                 entry_vwap: fill_price,
                 mark_price: fill_price,
                 realized_pnl: 0.0,
+                entry_fees: 0.0,
                 opened_at: now,
                 updated_at: now,
             });
@@ -293,17 +294,25 @@ impl PaperEngine {
             entry.entry_vwap =
                 (prior_notional + signed_fill.abs() * fill_price) / new_quantity.abs();
             entry.quantity = new_quantity;
+            entry.entry_fees += report.fee;
         } else {
             let closed_quantity = prior_quantity.abs().min(signed_fill.abs());
-            let realized_pnl =
+            let gross_realized_pnl =
                 (fill_price - entry.entry_vwap) * prior_quantity.signum() * closed_quantity;
-            entry.realized_pnl += realized_pnl;
-            self.cash += realized_pnl;
-            self.realized_pnl += realized_pnl;
+            let entry_fee = entry.entry_fees * closed_quantity / prior_quantity.abs();
+            let exit_fee = report.fee * closed_quantity / report.filled_quantity;
+            let net_closed_pnl = gross_realized_pnl - entry_fee - exit_fee;
+            report.closed_quantity = closed_quantity;
+            report.closed_pnl = net_closed_pnl;
+            entry.entry_fees = (entry.entry_fees - entry_fee).max(0.0);
+            entry.realized_pnl += gross_realized_pnl;
+            self.cash += gross_realized_pnl;
+            self.realized_pnl += gross_realized_pnl;
             let remaining = prior_quantity + signed_fill;
             entry.quantity = remaining;
             if remaining.signum() != prior_quantity.signum() && remaining.abs() > EPSILON {
                 entry.entry_vwap = fill_price;
+                entry.entry_fees = (report.fee - exit_fee).max(0.0);
                 entry.opened_at = now;
             }
         }
@@ -441,14 +450,14 @@ mod tests {
             max_market_order_qty: 150.0,
             tick_size: 0.1,
         };
-        engine
+        let open = engine
             .rebalance_to_notional("open", "BTCUSDT", 500.0, &rules, &book())
             .expect("open works")
             .expect("open trade is needed");
         let mut closing_book = book();
         closing_book.bids[0].price = 109.0;
         closing_book.asks[0].price = 111.0;
-        engine
+        let close = engine
             .rebalance_to_notional("close", "BTCUSDT", 0.0, &rules, &closing_book)
             .expect("close works")
             .expect("close trade is needed");
@@ -456,6 +465,8 @@ mod tests {
         let snapshot = engine.snapshot(Utc::now());
         assert!(engine.positions().is_empty());
         assert!((snapshot.realized_pnl - 40.0).abs() < 1e-9);
+        assert_eq!(close.closed_quantity, 5.0);
+        assert!((close.closed_pnl - (40.0 - open.fee - close.fee)).abs() < 1e-9);
         assert!((snapshot.equity - snapshot.cash).abs() < 1e-9);
         assert!(snapshot.equity > 1_000.0);
     }

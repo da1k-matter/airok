@@ -24,13 +24,13 @@
         <div class="metric-group">
           <div class="metric"><span class="metric-label">Equity</span><strong id="equity">—</strong></div>
           <div class="metric metric-pnl"><span class="metric-label">Total P&amp;L</span><strong id="total-pnl">—</strong><span class="metric-detail" id="total-pnl-return">—</span></div>
-          <div class="metric"><span class="metric-label">Max drawdown (daily close, all time)</span><strong id="max-drawdown">—</strong><span class="metric-detail" id="intraday-max-drawdown">Intraday: —</span></div>
-          <div class="metric"><span class="metric-label">Sharpe (closed UTC days)</span><strong id="sharpe">—</strong></div>
+          <div class="metric"><span class="metric-label">Max drawdown (all minute marks)</span><strong id="max-drawdown">—</strong></div>
+          <div class="metric"><span class="metric-label">Sharpe (minute equity returns)</span><strong id="sharpe">—</strong></div>
         </div>
         <div class="metric-group">
-          <div class="metric"><span class="metric-label">Profit factor (daily net P&amp;L)</span><strong id="profit-factor">—</strong></div>
-          <div class="metric"><span class="metric-label">Win rate (closed UTC days)</span><strong id="win-rate">—</strong></div>
-          <div class="metric"><span class="metric-label">Average return (closed UTC days)</span><strong id="average-return">—</strong></div>
+          <div class="metric"><span class="metric-label">Profit factor (closed trades)</span><strong id="profit-factor">—</strong></div>
+          <div class="metric"><span class="metric-label">Win rate (closed trades)</span><strong id="win-rate">—</strong></div>
+          <div class="metric"><span class="metric-label">Average minute return</span><strong id="average-return">—</strong></div>
           <div class="metric"><span class="metric-label">Fees paid</span><strong id="fees">—</strong></div>
         </div>
       </section>
@@ -65,10 +65,10 @@
 
       <section class="view" id="equity-view" aria-labelledby="equity-title">
         <div class="section-top">
-          <div><h2 class="section-title" id="equity-title">Equity curve</h2><p class="section-copy">One synchronized mark-to-market portfolio equity value at each confirmed UTC daily close, including realised and unrealised P&amp;L plus fees.</p></div>
+          <div><h2 class="section-title" id="equity-title">Equity curve</h2><p class="section-copy">Every stored UTC-minute mark-to-market point. Dense history is rendered with extrema-preserving buckets while the complete minute series remains in SQLite.</p></div>
           <div class="section-meta" id="equity-meta">Awaiting first close</div>
         </div>
-        <div class="chart-wrap"><svg id="chart" aria-label="Equity curve"></svg><div id="chart-tooltip" class="chart-tooltip"></div></div>
+        <div class="chart-wrap"><canvas id="chart" aria-label="Equity curve"></canvas><div id="chart-tooltip" class="chart-tooltip"></div></div>
       </section>
 
       <footer class="footer"><span>RankTrend / paper execution monitor</span><span id="model-info">Loading immutable model provenance…</span></footer>

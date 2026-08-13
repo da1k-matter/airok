@@ -141,6 +141,10 @@ pub struct ExecutionReport {
     pub vwap: Option<Price>,
     pub notional: Usd,
     pub fee: Usd,
+    #[serde(default)]
+    pub closed_quantity: Quantity,
+    #[serde(default)]
+    pub closed_pnl: Usd,
     pub slippage_bps: Option<f64>,
     pub consumed_levels: Vec<ConsumedLevel>,
     pub executed_at: DateTime<Utc>,
@@ -154,6 +158,8 @@ pub struct Position {
     pub entry_vwap: Price,
     pub mark_price: Price,
     pub realized_pnl: Usd,
+    #[serde(default)]
+    pub entry_fees: Usd,
     pub opened_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
