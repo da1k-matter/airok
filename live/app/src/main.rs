@@ -149,7 +149,7 @@ struct PositionView {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (config_path, once, replay, bootstrap_previous_day) = parse_arguments()?;
+    let (config_path, once, replay, no_bootstrap) = parse_arguments()?;
     let config = load_config(&config_path)?;
     let address: SocketAddr = config.server.bind.parse().context("parse server.bind")?;
     if let Some(replay) = replay {
@@ -170,11 +170,7 @@ async fn main() -> Result<()> {
         .and_then(|id| id.strip_prefix("ranktrend-1d-").map(ToOwned::to_owned));
     let paper_config = paper_config(&config);
     let restored_state = ledger.load_engine_state(PAPER_SESSION_ID)?;
-    if bootstrap_previous_day && restored_state.is_some() {
-        bail!(
-            "--bootstrap-previous-day requires a fresh paper ledger; remove the existing local paper state first"
-        );
-    }
+    let bootstrap_previous_day = should_bootstrap_previous_day(restored_state.is_none(), no_bootstrap);
     let engine = if let Some(state) = restored_state {
         PaperEngine::restore(paper_config, state)?
     } else {
@@ -206,7 +202,7 @@ async fn main() -> Result<()> {
         set_status(
             &state,
             "waiting_for_daily_close",
-            "Waiting for a confirmed 1D close. Use --bootstrap-previous-day only for a fresh paper session.",
+            "Waiting for a confirmed 1D close.",
         );
     }
     tokio::spawn(run_live_loop(
@@ -266,7 +262,7 @@ fn parse_arguments() -> Result<(PathBuf, bool, Option<ReplayRequest>, bool)> {
     let mut replay_bundle = None;
     let mut warmup_bundle = None;
     let mut reference = None;
-    let mut bootstrap_previous_day = false;
+    let mut no_bootstrap = false;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -274,7 +270,7 @@ fn parse_arguments() -> Result<(PathBuf, bool, Option<ReplayRequest>, bool)> {
                 config = PathBuf::from(arguments.next().context("missing --config path")?)
             }
             "--once" => once = true,
-            "--bootstrap-previous-day" => bootstrap_previous_day = true,
+            "--no-bootstrap" => no_bootstrap = true,
             "--replay-start" => {
                 replay_start = Some(NaiveDate::parse_from_str(
                     &arguments.next().context("missing --replay-start date")?,
@@ -323,10 +319,17 @@ fn parse_arguments() -> Result<(PathBuf, bool, Option<ReplayRequest>, bool)> {
     if replay.is_some() && once {
         bail!("--once cannot be combined with historical replay")
     }
-    if replay.is_some() && bootstrap_previous_day {
-        bail!("--bootstrap-previous-day cannot be combined with historical replay")
+    if once && no_bootstrap {
+        bail!("--once cannot be combined with --no-bootstrap")
     }
-    Ok((config, once, replay, bootstrap_previous_day))
+    if replay.is_some() && no_bootstrap {
+        bail!("--no-bootstrap cannot be combined with historical replay")
+    }
+    Ok((config, once, replay, no_bootstrap))
+}
+
+fn should_bootstrap_previous_day(fresh_paper_ledger: bool, no_bootstrap: bool) -> bool {
+    fresh_paper_ledger && !no_bootstrap
 }
 
 fn paper_config(config: &RuntimeConfig) -> PaperConfig {
@@ -1321,4 +1324,17 @@ async fn app_js() -> impl IntoResponse {
         [("content-type", "text/javascript; charset=utf-8")],
         include_str!("../../ui/app.js"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_bootstrap_previous_day;
+
+    #[test]
+    fn bootstrap_is_default_only_for_a_fresh_paper_ledger() {
+        assert!(should_bootstrap_previous_day(true, false));
+        assert!(!should_bootstrap_previous_day(true, true));
+        assert!(!should_bootstrap_previous_day(false, false));
+        assert!(!should_bootstrap_previous_day(false, true));
+    }
 }

@@ -30,13 +30,17 @@ The default runtime configuration reads the shared historical candle directory a
 
 ### First paper-session bootstrap
 
-For a brand-new paper session, use the explicit bootstrap flag once. It rebuilds any missing causal OHLCV history when needed, but creates exactly one paper decision: from yesterday's confirmed UTC candle. It then waits for subsequent 1D closes through WebSocket; no paper trades are backfilled for missed days.
+For a brand-new paper session, the default launch automatically bootstraps exactly one paper decision from yesterday's confirmed UTC candle. It rebuilds missing causal OHLCV history when needed, then waits for subsequent 1D closes through WebSocket. No paper trades are backfilled for missed days.
 
 ```bash
-cargo run --release -p ranktrend-paper -- --config config/paper.toml --bootstrap-previous-day
+cargo run --release -p ranktrend-paper -- --config config/paper.toml
 ```
 
-Do not use this flag after a paper ledger already exists: the regular launch restores the ledger and only waits for the next confirmed close.
+When a paper ledger already exists, the regular launch restores it and only waits for the next confirmed close. To create a fresh empty session without its initial one-day decision, launch with `--no-bootstrap` after removing the existing paper state:
+
+```bash
+cargo run --release -p ranktrend-paper -- --config config/paper.toml --no-bootstrap
+```
 
 ## Historical OOS parity replay
 
