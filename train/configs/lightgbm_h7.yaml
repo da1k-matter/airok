@@ -59,7 +59,7 @@ execution:
   order_type: market
 evaluation:
   oos_start: 2023-08-05
-  oos_end: 2026-08-04
+  oos_end: 2026-08-12
   latest_year_start: 2025-08-05
   periods_per_year: 365
   fee_stress_bps: [5, 10, 15, 20, 30]

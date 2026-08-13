@@ -23,17 +23,6 @@ def digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def final_retrain_date(
-    cutoff: pd.Timestamp,
-    prediction_start: pd.Timestamp,
-    retrain_days: int,
-) -> pd.Timestamp:
-    date = prediction_start
-    while date + pd.Timedelta(days=retrain_days) <= cutoff:
-        date += pd.Timedelta(days=retrain_days)
-    return date
-
-
 def parameters(config: ExperimentConfig, seed: int) -> dict[str, object]:
     defaults: dict[str, object] = {
         "objective": "lambdarank",
@@ -63,7 +52,7 @@ def main() -> None:
     parser.add_argument(
         "--prediction-date",
         type=pd.Timestamp,
-        help="Export the exact walk-forward fold beginning on this scheduled prediction date.",
+        help="Export a causal fold beginning on this date. Defaults to the latest complete dataset date.",
     )
     arguments = parser.parse_args()
     if arguments.bundle.exists():
@@ -91,20 +80,11 @@ def main() -> None:
     cutoff = dates[-1].normalize()
     prediction_date = arguments.prediction_date
     if prediction_date is None:
-        prediction_date = final_retrain_date(
-            cutoff,
-            pd.Timestamp(training["prediction_start"]),
-            int(training["retrain_every_days"]),
-        )
+        prediction_date = cutoff
     else:
         prediction_date = prediction_date.normalize()
-        scheduled = pd.date_range(
-            pd.Timestamp(training["prediction_start"]),
-            cutoff,
-            freq=f"{int(training['retrain_every_days'])}D",
-        )
-        if prediction_date not in scheduled:
-            raise SystemExit("--prediction-date must be a scheduled walk-forward retrain date")
+    if prediction_date > cutoff:
+        raise SystemExit("--prediction-date cannot be after the dataset cutoff")
     prediction_index = int(np.searchsorted(dates.values, np.datetime64(prediction_date), side="left"))
     train_end = prediction_index - horizon_days - 2
     train_start = max(0, train_end - int(training["train_window_days"]) + 1)
@@ -141,6 +121,9 @@ def main() -> None:
         "horizon_days": horizon_days,
         "aggregation": "median_rank",
         "cutoff_date": str(cutoff.date()),
+        "prediction_date": str(prediction_date.date()),
+        "train_start_date": str(dates[train_start].date()),
+        "train_end_date": str(dates[train_end].date()),
         "feature_schema_sha256": digest(canonical_json(feature_contract)),
         "universe_sha256": digest(canonical_json(universe)),
         "models": models,

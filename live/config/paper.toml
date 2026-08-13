@@ -1,5 +1,5 @@
 [model]
-bundle = "models/lightgbm_h7_20260804_python"
+bundle = "models/lightgbm_h7_20260812"
 
 [data]
 directory = "../train/data/1d"

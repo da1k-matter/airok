@@ -23,7 +23,7 @@ ranktrend/
     ├── app/                 Service binary and dashboard assets
     ├── crates/              Domain libraries
     ├── config/              Runtime configuration
-    ├── models/              Frozen model bundles (ignored)
+    ├── models/              Frozen model bundles (versioned in Git)
     └── state/               SQLite paper ledger (ignored)
 ```
 

@@ -15,6 +15,13 @@ python src/cli.py run --config configs/lightgbm_h7.yaml --data-dir data/1d
 python -m pytest -q
 ```
 
+Refresh the local panel before a new production export. The command requests only
+confirmed days, ending at yesterday UTC by default:
+
+```bash
+python src/update_data.py --data-dir data/1d
+```
+
 `configs/lightgbm_h7.yaml` is the production candidate: a five-seed LightGBM LambdaRank ensemble with median-rank aggregation.
 
 ## Local artifacts
@@ -34,4 +41,6 @@ python src/export_bundle.py \
 
 After export, change `../live/config/paper.toml` to reference the exact bundle directory. Rust inference must use the identical feature contract and frozen bundle.
 
-Pass `--prediction-date YYYY-MM-DD` to export one particular scheduled 56-day walk-forward fold for the Rust historical parity replay. The date must match the configured `retrain_every_days` schedule.
+By default the exporter trains the newest causal fold available in the dataset.
+Pass `--prediction-date YYYY-MM-DD` to export a particular earlier causal fold for
+the Rust historical parity replay.

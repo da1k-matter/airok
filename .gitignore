@@ -18,6 +18,8 @@ target/
 **/data/
 **/outputs/
 models/
+!live/models/
+!live/models/**
 live/state/
 train/outputs/**/*.html
 

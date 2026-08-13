@@ -1,0 +1,36 @@
+{
+  "bundle_id": "lightgbm-h7-20260804",
+  "backend": "lightgbm",
+  "horizon_days": 7,
+  "aggregation": "median_rank",
+  "cutoff_date": "2026-08-04",
+  "feature_schema_sha256": "36b3b630cc86f4d1e714f3e5133b9bde5fd3fe51f53e0a79afd76771192a22ed",
+  "universe_sha256": "d19feed5d906df207a82dceb517110b4b4d08430cf8adb61c4589d9cfa47926f",
+  "models": [
+    {
+      "seed": 11,
+      "file": "seed_11.txt",
+      "sha256": "3d2c2e0e718bc4fa2e0e9fa67cc021328e5fa4120b5fe415c03457f108638299"
+    },
+    {
+      "seed": 23,
+      "file": "seed_23.txt",
+      "sha256": "4e70aa655b7ed149a54fb78e8f216b75b46557b50169dd97cf23145fe31f5cd6"
+    },
+    {
+      "seed": 37,
+      "file": "seed_37.txt",
+      "sha256": "debbcde1b15399341dfe8ae016fa9ec8fe9debbc9c93ada83c96b0518f56f39d"
+    },
+    {
+      "seed": 53,
+      "file": "seed_53.txt",
+      "sha256": "205498f8f9952e46501dd36b0a48db1bb7892c222a37a52c5b017aacbfd93046"
+    },
+    {
+      "seed": 71,
+      "file": "seed_71.txt",
+      "sha256": "bd959327efc99b2dff7e09c6e4e00b5889a19f8cb82909f0afed3dbfc2b8bc6a"
+    }
+  ]
+}

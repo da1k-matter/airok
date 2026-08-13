@@ -12,7 +12,7 @@ live/
 ├── crates/              Focused domain libraries
 ├── config/paper.toml    Runtime settings
 ├── ui/                  Static HTML, CSS, and JavaScript dashboard
-├── models/              Immutable bundles exported by train (ignored)
+├── models/              Immutable bundles exported by train (versioned in Git)
 └── state/paper/         SQLite ledger and WAL files (ignored)
 ```
 
