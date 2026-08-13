@@ -23,3 +23,6 @@ train/outputs/**/*.html
 
 # Local archives
 *.tar.zst
+
+# Generated research reports at the repository root
+/*.html
