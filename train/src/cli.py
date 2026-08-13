@@ -21,7 +21,7 @@ def configure_logging(verbose: bool = False) -> None:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         prog="ranktrend",
-        description="Cross-sectional crypto ranking with LightGBM or CatBoost",
+        description="Cross-sectional crypto ranking with LightGBM",
     )
     root.add_argument("--verbose", action="store_true")
     sub = root.add_subparsers(dest="command", required=True)

@@ -10,7 +10,7 @@ from typing import Any
 
 import yaml
 
-ALLOWED_BACKENDS = {"lightgbm", "catboost"}
+ALLOWED_BACKENDS = {"lightgbm"}
 ALLOWED_AGGREGATIONS = {"mean_rank", "median_rank", "portfolio_average"}
 ALLOWED_WEIGHTING = {"equal", "invvol"}
 

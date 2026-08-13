@@ -1,10 +1,10 @@
-# RankTrend trainer
+# RankTrend training
 
-The Python trainer owns the complete offline pipeline: data validation, causal feature construction, walk-forward LightGBM/CatBoost training, portfolio construction, backtesting, reporting, and immutable LightGBM-bundle export.
+The Python training project owns the complete offline pipeline: data validation, causal feature construction, walk-forward LightGBM training, portfolio construction, backtesting, reporting, and immutable LightGBM-bundle export.
 
 ## Commands
 
-Run these from `trainer/` with the Python environment already activated:
+Run these from `train/` with the Python environment already activated:
 
 ```bash
 python src/cli.py doctor --config configs/lightgbm_h7.yaml --data-dir data/1d
@@ -15,7 +15,7 @@ python src/cli.py run --config configs/lightgbm_h7.yaml --data-dir data/1d
 python -m pytest -q
 ```
 
-`configs/lightgbm_h7.yaml` is the production candidate: a five-seed LightGBM LambdaRank ensemble with median-rank aggregation. `configs/catboost_h7.yaml` is a research challenger.
+`configs/lightgbm_h7.yaml` is the production candidate: a five-seed LightGBM LambdaRank ensemble with median-rank aggregation.
 
 ## Local artifacts
 

@@ -110,7 +110,8 @@ function performanceMetrics(rows, currentEquity) {
 function renderPerformance(rows, equity) {
   const metrics = performanceMetrics(rows, equity);
   const set = (id, value, className = '') => { const element = document.querySelector(id); element.textContent = value; element.className = className; };
-  set('#total-pnl', Number.isFinite(metrics.totalPnl) ? `${signedMoney(metrics.totalPnl)} · ${percent(metrics.totalReturn)}` : '—', classFor(metrics.totalPnl));
+  set('#total-pnl', Number.isFinite(metrics.totalPnl) ? signedMoney(metrics.totalPnl) : '—', classFor(metrics.totalPnl));
+  set('#total-pnl-return', Number.isFinite(metrics.totalReturn) ? `${percent(metrics.totalReturn)} since inception` : '—', classFor(metrics.totalReturn));
   set('#max-drawdown', Number.isFinite(metrics.maxDrawdown) ? percent(metrics.maxDrawdown) : '—', metrics.maxDrawdown < 0 ? 'neg' : '');
   set('#sharpe', Number.isFinite(metrics.sharpe) ? metrics.sharpe.toFixed(2) : '—', classFor(metrics.sharpe));
   set('#profit-factor', Number.isFinite(metrics.profitFactor) ? metrics.profitFactor.toFixed(2) : '—', classFor((metrics.profitFactor ?? 1) - 1));

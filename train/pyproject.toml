@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ranktrend-gbm"
 version = "2.0.0"
-description = "Compact cross-sectional crypto ranking pipeline with LightGBM and CatBoost"
+description = "Compact cross-sectional crypto ranking pipeline with LightGBM"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -14,7 +14,6 @@ dependencies = [
   "scipy>=1.11",
   "numba>=0.59",
   "lightgbm>=4.3",
-  "catboost>=1.2.7",
   "PyYAML>=6.0",
   "matplotlib>=3.8",
 ]

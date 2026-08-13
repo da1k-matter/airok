@@ -19,7 +19,7 @@ target/
 **/outputs/
 models/
 live/state/
-trainer/outputs/**/*.html
+train/outputs/**/*.html
 
 # Local archives
 *.tar.zst

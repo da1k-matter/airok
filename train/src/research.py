@@ -244,39 +244,6 @@ def _fit_predict_lightgbm(
         return model.predict(x_predict).astype(np.float32)
 
 
-def _fit_predict_catboost(
-    x_train: np.ndarray,
-    y_train: np.ndarray,
-    dates_train: np.ndarray,
-    x_predict: np.ndarray,
-    params: dict[str, Any],
-    seed: int,
-) -> np.ndarray:
-    from catboost import CatBoostRanker, Pool
-
-    defaults: dict[str, Any] = {
-        "loss_function": "YetiRankPairwise:mode=NDCG;top=8;type=Base",
-        "iterations": 160,
-        "depth": 6,
-        "learning_rate": 0.05,
-        "l2_leaf_reg": 8.0,
-        "random_strength": 0.5,
-        "bootstrap_type": "Bernoulli",
-        "subsample": 0.85,
-        "rsm": 0.80,
-        "border_count": 127,
-        "thread_count": 4,
-        "allow_writing_files": False,
-        "verbose": False,
-    }
-    defaults.update(params)
-    defaults["random_seed"] = seed
-    model = CatBoostRanker(**defaults)
-    pool = Pool(x_train, label=y_train.astype(np.int32), group_id=dates_train)
-    model.fit(pool, verbose=False)
-    return model.predict(x_predict).astype(np.float32)
-
-
 def train_walk_forward(
     ctx: dict[str, Any],
     rows: dict[str, np.ndarray],
@@ -322,8 +289,9 @@ def train_walk_forward(
         if train_rows.size < int(training.get("minimum_train_rows", 5000)) or predict_rows.size == 0:
             continue
 
-        fit_predict = _fit_predict_lightgbm if backend == "lightgbm" else _fit_predict_catboost
-        prediction = fit_predict(
+        if backend != "lightgbm":
+            raise ValueError(f"Unsupported backend: {backend!r}")
+        prediction = _fit_predict_lightgbm(
             x_all[train_rows],
             y_all[train_rows],
             date_rows[train_rows],

@@ -2,7 +2,7 @@
 bundle = "models/lightgbm_h7_20260804_python"
 
 [data]
-directory = "../trainer/data/1d"
+directory = "../train/data/1d"
 
 [paper]
 initial_equity_usd = 1000.0

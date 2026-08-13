@@ -4,7 +4,7 @@ RankTrend has two intentionally separate systems:
 
 | Directory | Owner | Purpose |
 | --- | --- | --- |
-| [`trainer/`](trainer/) | Python | Feature research, walk-forward model training, backtests, reports, and model export. |
+| [`train/`](train/) | Python | Feature research, walk-forward model training, backtests, reports, and model export. |
 | [`live/`](live/) | Rust | Bybit market-data ingestion, model inference, paper execution, persistent ledger, API, and dashboard. |
 
 There is no Python runtime in the live service. Python produces an immutable LightGBM bundle; Rust loads that bundle through `lightgbm3` and performs inference only.
@@ -13,7 +13,7 @@ There is no Python runtime in the live service. Python produces an immutable Lig
 
 ```text
 ranktrend/
-├── trainer/                 Python research and training project
+├── train/                   Python research and training project
 │   ├── configs/             Research model specifications
 │   ├── data/1d/             Local daily candle source data (ignored)
 │   ├── src/                 Flat Python pipeline
@@ -34,14 +34,14 @@ Each subsystem is started from its own directory. Nothing at repository root is 
 Run research and backtests:
 
 ```bash
-cd trainer
+cd train
 python src/cli.py run --config configs/lightgbm_h7.yaml --data-dir data/1d
 ```
 
 Export the final Python-trained bundle for the Rust service:
 
 ```bash
-cd trainer
+cd train
 python src/export_bundle.py \
   --config configs/lightgbm_h7.yaml \
   --data data/1d \
@@ -57,4 +57,4 @@ cargo run --release -p ranktrend-paper -- --config config/paper.toml
 
 The dashboard is available at `http://127.0.0.1:8789`. The service uses public Bybit endpoints only and does not have private credentials or order-placement code.
 
-See [`trainer/README.md`](trainer/README.md) for the research contract and [`live/README.md`](live/README.md) for live-runtime behavior.
+See [`train/README.md`](train/README.md) for the research contract and [`live/README.md`](live/README.md) for live-runtime behavior.

@@ -49,6 +49,9 @@ h1 { margin: 0; font-size: clamp(46px, 6.2vw, 92px); font-weight: 740; line-heig
 .metric strong { display: block; overflow: hidden; margin-top: 8px; font: 740 clamp(21px, 2.1vw, 31px)/1 var(--sans); letter-spacing: -.055em; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
 .metric strong.pos { color: var(--positive); }
 .metric strong.neg { color: var(--negative); }
+.metric-detail { display: block; min-height: 15px; margin-top: 7px; color: var(--faint); font: 700 10px/1.3 var(--mono); letter-spacing: .02em; font-variant-numeric: tabular-nums; }
+.metric-pnl .metric-detail.pos { color: color-mix(in srgb, var(--positive) 72%, var(--faint)); }
+.metric-pnl .metric-detail.neg { color: color-mix(in srgb, var(--negative) 72%, var(--faint)); }
 
 .main-nav { display: flex; align-items: stretch; gap: 24px; margin-top: 27px; border-bottom: 1px solid var(--line); }
 .nav-button { position: relative; min-height: 48px; padding: 0; border: 0; color: var(--faint); background: transparent; cursor: pointer; font: 800 11px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; transition: color .15s ease; }

@@ -142,7 +142,7 @@ def save_plots(daily: pd.DataFrame, output_dir: Path) -> None:
 
 def environment_text() -> str:
     packages: dict[str, str] = {}
-    for name in ("numpy", "pandas", "scipy", "numba", "lightgbm", "catboost", "yaml", "matplotlib"):
+    for name in ("numpy", "pandas", "scipy", "numba", "lightgbm", "yaml", "matplotlib"):
         try:
             module = __import__(name)
             packages[name] = str(getattr(module, "__version__", "unknown"))
