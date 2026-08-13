@@ -1,0 +1,10 @@
+[package]
+name = "rt-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+rt-domain = { path = "../rt-domain" }
+thiserror.workspace = true

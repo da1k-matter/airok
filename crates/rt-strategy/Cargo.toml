@@ -1,0 +1,10 @@
+[package]
+name = "rt-strategy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rt-domain = { path = "../rt-domain" }
+serde.workspace = true
+thiserror.workspace = true

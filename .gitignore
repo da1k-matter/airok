@@ -11,9 +11,13 @@ __pycache__/
 .venv/
 venv/
 
+# Rust build products
+target/
+
 # Local datasets and generated research artifacts
 **/data/
 **/outputs/
+models/
 *.html
 
 # Local archives

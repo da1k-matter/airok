@@ -1,0 +1,27 @@
+[package]
+name = "ranktrend-paper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+csv.workspace = true
+futures-util.workspace = true
+parking_lot.workspace = true
+rt-bybit = { path = "../../crates/rt-bybit" }
+rt-domain = { path = "../../crates/rt-domain" }
+rt-engine = { path = "../../crates/rt-engine" }
+rt-execution = { path = "../../crates/rt-execution" }
+rt-ledger = { path = "../../crates/rt-ledger" }
+rt-model = { path = "../../crates/rt-model" }
+rt-panel = { path = "../../crates/rt-panel" }
+rt-strategy = { path = "../../crates/rt-strategy" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["time"] }
+toml.workspace = true
+tower-http.workspace = true

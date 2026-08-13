@@ -1,0 +1,25 @@
+[model]
+bundle = "models/lightgbm_h7_20260804_python"
+
+[data]
+directory = "data/1d"
+
+[paper]
+initial_equity_usd = 1000.0
+gross_leverage = 1.0
+max_gross_leverage = 1.25
+fee_bps = 10.0
+reject_partial_fills = true
+
+[server]
+bind = "127.0.0.1:8789"
+
+[storage]
+ledger_path = "data/live/ranktrend-paper.sqlite3"
+
+[bybit]
+orderbook_depth = 50
+rest_parallelism = 12
+ws_batch_size = 10
+close_grace_seconds = 90
+minimum_confirmed_coverage = 0.80

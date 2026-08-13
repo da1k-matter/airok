@@ -194,12 +194,35 @@ Set exactly one of `tail_count` or `tail_fraction`.
 
 ## Research limitations
 
-This code is suitable for reproducible research and generating portfolio targets, but the available archive has known limitations:
+The historical research archive has known limitations:
 
 - likely survivorship bias because historically delisted perpetuals are absent;
 - no funding cash flows;
 - no mark-price or liquidation path;
 - no order-book impact model;
-- no exchange/API execution layer.
+- no historical point-in-time order-book archive.
 
 Backtest Sharpe is therefore not a live-performance guarantee. Before deployment, add point-in-time delisted contracts, funding and execution simulation.
+
+## Rust paper-trading simulator
+
+The live simulator is a separate Rust workspace. It subscribes to the confirmed public Bybit linear 1D candle of every currently tradable contract in the immutable model universe, waits for the configured close-coverage threshold, and uses the public REST API only to repair missing contracts. It then recomputes the full causal feature panel, which dynamically selects the same liquidity-ranked universe as research, scores the frozen ensemble, and simulates fills from one public order-book snapshot per target order. It has no private API credentials and cannot place exchange orders.
+
+Train and export the immutable LightGBM bundle in the Python research environment:
+
+```bash
+python scripts/export_lightgbm_bundle.py \
+  --config configs/lightgbm_h7.yaml \
+  --data data/1d \
+  --bundle models/lightgbm_h7_20260804_python
+```
+
+The exporter refuses to overwrite a bundle. The resulting manifest pins the model hashes, feature contract, universe, cutoff date, and seed aggregation. Python owns training; the Rust service uses `lightgbm3` only for inference and needs neither Python nor a runtime LightGBM dylib.
+
+Start the paper service:
+
+```bash
+cargo run --release -p ranktrend-paper -- --config configs/paper.toml
+```
+
+Open `http://127.0.0.1:8789`. The dashboard is Rust/WASM and shows the persisted $1,000 paper account, current positions, execution tape, and equity curve. The SQLite ledger location, Bybit public-feed settings, execution rules, and risk limits are all explicit in `configs/paper.toml`.

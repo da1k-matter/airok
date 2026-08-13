@@ -1,0 +1,47 @@
+[workspace]
+members = [
+  "crates/rt-domain",
+  "crates/rt-bybit",
+  "crates/rt-execution",
+  "crates/rt-ledger",
+  "crates/rt-model",
+  "crates/rt-panel",
+  "crates/rt-strategy",
+  "crates/rt-engine",
+  "crates/rt-dashboard",
+  "apps/ranktrend-paper",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+authors = ["RankTrend"]
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+axum = "0.8.4"
+chrono = { version = "0.4.41", features = ["serde"] }
+csv = "1.3.1"
+futures-util = "0.3.31"
+parking_lot = "0.12.4"
+reqwest = { version = "0.12.15", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.37.0", features = ["bundled", "chrono"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+thiserror = "2.0.12"
+js-sys = "0.3.83"
+wasm-bindgen = "0.2.106"
+wasm-bindgen-futures = "0.4.56"
+web-sys = "0.3.83"
+tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+tokio-tungstenite = { version = "0.26.2", features = ["rustls-tls-webpki-roots"] }
+toml = "0.8.23"
+tower-http = { version = "0.6.6", features = ["trace"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
