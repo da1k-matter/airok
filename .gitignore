@@ -11,8 +11,10 @@ __pycache__/
 .venv/
 venv/
 
-# Rust build products
-target/
+# Rust build products and locally copied release binaries
+**/target/
+/live/ranktrend-paper
+/live/ranktrend-score-bundle
 
 # Local datasets and generated research artifacts
 **/data/
