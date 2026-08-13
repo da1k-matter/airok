@@ -1305,16 +1305,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rt-dashboard"
-version = "0.1.0"
-dependencies = [
- "js-sys",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
 name = "rt-domain"
 version = "0.1.0"
 dependencies = [

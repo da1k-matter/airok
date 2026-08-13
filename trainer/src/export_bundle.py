@@ -60,6 +60,11 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=Path("configs/lightgbm_h7.yaml"))
     parser.add_argument("--data", type=Path)
     parser.add_argument("--bundle", type=Path, required=True, help="Destination under ../live/models/")
+    parser.add_argument(
+        "--prediction-date",
+        type=pd.Timestamp,
+        help="Export the exact walk-forward fold beginning on this scheduled prediction date.",
+    )
     arguments = parser.parse_args()
     if arguments.bundle.exists():
         raise SystemExit(f"refusing to overwrite existing bundle: {arguments.bundle}")
@@ -84,11 +89,22 @@ def main() -> None:
     labels = target[rows["date_idx"], rows["asset_idx"]]
     dates = pd.DatetimeIndex(ctx["dates"])
     cutoff = dates[-1].normalize()
-    prediction_date = final_retrain_date(
-        cutoff,
-        pd.Timestamp(training["prediction_start"]),
-        int(training["retrain_every_days"]),
-    )
+    prediction_date = arguments.prediction_date
+    if prediction_date is None:
+        prediction_date = final_retrain_date(
+            cutoff,
+            pd.Timestamp(training["prediction_start"]),
+            int(training["retrain_every_days"]),
+        )
+    else:
+        prediction_date = prediction_date.normalize()
+        scheduled = pd.date_range(
+            pd.Timestamp(training["prediction_start"]),
+            cutoff,
+            freq=f"{int(training['retrain_every_days'])}D",
+        )
+        if prediction_date not in scheduled:
+            raise SystemExit("--prediction-date must be a scheduled walk-forward retrain date")
     prediction_index = int(np.searchsorted(dates.values, np.datetime64(prediction_date), side="left"))
     train_end = prediction_index - horizon_days - 2
     train_start = max(0, train_end - int(training["train_window_days"]) + 1)

@@ -33,3 +33,5 @@ python src/export_bundle.py \
 ```
 
 After export, change `../live/config/paper.toml` to reference the exact bundle directory. Rust inference must use the identical feature contract and frozen bundle.
+
+Pass `--prediction-date YYYY-MM-DD` to export one particular scheduled 56-day walk-forward fold for the Rust historical parity replay. The date must match the configured `retrain_every_days` schedule.

@@ -12,7 +12,7 @@ use rt_bybit::{BybitPublicClient, base_symbol, bybit_linear_symbol};
 use rt_domain::{AccountSnapshot, Candle};
 use rt_engine::{PaperConfig, PaperEngine, RiskLimits};
 use rt_execution::SnapshotExecutionConfig;
-use rt_ledger::Ledger;
+use rt_ledger::{EquityPoint, Ledger};
 use rt_model::{BundleMetadata, LightGbmLibrary, NativeBooster, inspect_bundle};
 use rt_panel::{
     FeaturePanel, MarketPanel, build_features, load_daily_csv_panel, merge_confirmed_daily_candles,
@@ -86,8 +86,17 @@ struct BybitConfig {
 struct AppState {
     engine: Arc<Mutex<PaperEngine>>,
     ledger: Arc<Mutex<Ledger>>,
-    model_bundle: Arc<str>,
+    model: ModelView,
     runtime: Arc<Mutex<RuntimeStatus>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ModelView {
+    bundle_id: String,
+    backend: String,
+    horizon_days: u32,
+    cutoff_date: String,
+    seed_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,7 +122,7 @@ impl RuntimeStatus {
 struct SessionView {
     status: String,
     detail: String,
-    model_bundle: String,
+    model: ModelView,
     account: AccountSnapshot,
     last_decision_date: Option<String>,
     last_error: Option<String>,
@@ -122,16 +131,28 @@ struct SessionView {
 #[derive(Debug, Serialize)]
 struct PositionView {
     symbol: String,
+    side: String,
     quantity: f64,
+    notional: f64,
+    entry_price: f64,
     mark_price: f64,
     unrealized_pnl: f64,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (config_path, once) = parse_arguments()?;
+    let (config_path, once, replay) = parse_arguments()?;
     let config = load_config(&config_path)?;
     let address: SocketAddr = config.server.bind.parse().context("parse server.bind")?;
+    if let Some(replay) = replay {
+        let bundle = inspect_bundle(&replay.bundle)?;
+        let warmup_bundle = inspect_bundle(&replay.warmup_bundle)?;
+        let replay_run =
+            run_historical_replay(&config, bundle.clone(), warmup_bundle, replay).await?;
+        serve_replay_dashboard(address, bundle, replay_run).await?;
+        return Ok(());
+    }
+    let bundle = inspect_bundle(&config.model.bundle)?;
     if let Some(parent) = config.storage.ledger_path.parent() {
         fs::create_dir_all(parent).context("create ledger directory")?;
     }
@@ -150,7 +171,13 @@ async fn main() -> Result<()> {
     let state = AppState {
         engine: Arc::new(Mutex::new(engine)),
         ledger: Arc::new(Mutex::new(ledger)),
-        model_bundle: Arc::from(config.model.bundle.to_string_lossy().to_string()),
+        model: ModelView {
+            bundle_id: bundle.manifest.bundle_id,
+            backend: bundle.manifest.backend,
+            horizon_days: bundle.manifest.horizon_days,
+            cutoff_date: bundle.manifest.cutoff_date,
+            seed_count: bundle.manifest.models.len(),
+        },
         runtime: Arc::new(Mutex::new(RuntimeStatus {
             last_decision_date,
             ..RuntimeStatus::booting()
@@ -168,8 +195,8 @@ async fn main() -> Result<()> {
         .route("/api/positions", get(positions))
         .route("/api/executions", get(executions))
         .route("/api/equity", get(equity))
-        .route("/assets/dashboard.js", get(dashboard_js))
-        .route("/assets/dashboard_bg.wasm", get(dashboard_wasm))
+        .route("/assets/styles.css", get(styles))
+        .route("/assets/app.js", get(app_js))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     println!("RankTrend paper dashboard: http://{address}");
@@ -181,9 +208,36 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_arguments() -> Result<(PathBuf, bool)> {
+struct ReplayRequest {
+    start: NaiveDate,
+    end: NaiveDate,
+    bundle: PathBuf,
+    warmup_bundle: PathBuf,
+    reference: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct ReplayAppState {
+    model: ModelView,
+    account: AccountSnapshot,
+    last_decision_date: String,
+    equity: Vec<EquityPoint>,
+}
+
+struct ReplayRun {
+    account: AccountSnapshot,
+    last_decision_date: String,
+    equity: Vec<EquityPoint>,
+}
+
+fn parse_arguments() -> Result<(PathBuf, bool, Option<ReplayRequest>)> {
     let mut config = PathBuf::from("config/paper.toml");
     let mut once = false;
+    let mut replay_start = None;
+    let mut replay_end = None;
+    let mut replay_bundle = None;
+    let mut warmup_bundle = None;
+    let mut reference = None;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -191,10 +245,55 @@ fn parse_arguments() -> Result<(PathBuf, bool)> {
                 config = PathBuf::from(arguments.next().context("missing --config path")?)
             }
             "--once" => once = true,
+            "--replay-start" => {
+                replay_start = Some(NaiveDate::parse_from_str(
+                    &arguments.next().context("missing --replay-start date")?,
+                    "%Y-%m-%d",
+                )?)
+            }
+            "--replay-end" => {
+                replay_end = Some(NaiveDate::parse_from_str(
+                    &arguments.next().context("missing --replay-end date")?,
+                    "%Y-%m-%d",
+                )?)
+            }
+            "--replay-bundle" => {
+                replay_bundle = Some(PathBuf::from(
+                    arguments.next().context("missing --replay-bundle path")?,
+                ))
+            }
+            "--warmup-bundle" => {
+                warmup_bundle = Some(PathBuf::from(
+                    arguments.next().context("missing --warmup-bundle path")?,
+                ))
+            }
+            "--reference" => {
+                reference = Some(PathBuf::from(
+                    arguments.next().context("missing --reference path")?,
+                ))
+            }
             _ => bail!("unknown argument {argument}"),
         }
     }
-    Ok((config, once))
+    let replay = match (replay_start, replay_end, replay_bundle, warmup_bundle) {
+        (None, None, None, None) => None,
+        (Some(start), Some(end), Some(bundle), Some(warmup_bundle)) if start <= end => {
+            Some(ReplayRequest {
+                start,
+                end,
+                bundle,
+                warmup_bundle,
+                reference,
+            })
+        }
+        _ => bail!(
+            "historical replay requires --replay-start YYYY-MM-DD --replay-end YYYY-MM-DD --replay-bundle PATH and --warmup-bundle PATH"
+        ),
+    };
+    if replay.is_some() && once {
+        bail!("--once cannot be combined with historical replay")
+    }
+    Ok((config, once, replay))
 }
 
 fn paper_config(config: &RuntimeConfig) -> PaperConfig {
@@ -595,6 +694,210 @@ async fn decide_for_latest(
     Ok(())
 }
 
+async fn run_historical_replay(
+    config: &RuntimeConfig,
+    bundle: BundleMetadata,
+    warmup_bundle: BundleMetadata,
+    replay: ReplayRequest,
+) -> Result<ReplayRun> {
+    if bundle.universe.symbols != warmup_bundle.universe.symbols
+        || bundle.features.names != warmup_bundle.features.names
+    {
+        bail!("replay and warm-up bundles have different immutable contracts");
+    }
+    let market = load_daily_csv_panel(&config.data.directory)?;
+    if market.symbols != bundle.universe.symbols {
+        bail!("local data universe differs from the replay model contract");
+    }
+    let panel = build_features(market, 180, 150)?;
+    let start = panel
+        .market
+        .dates
+        .iter()
+        .position(|date| *date == replay.start)
+        .with_context(|| {
+            format!(
+                "replay start {} is absent from the market panel",
+                replay.start
+            )
+        })?;
+    let end = panel
+        .market
+        .dates
+        .iter()
+        .position(|date| *date == replay.end)
+        .with_context(|| format!("replay end {} is absent from the market panel", replay.end))?;
+    if start < 22 || end >= panel.market.dates.len().saturating_sub(1) {
+        bail!("replay needs 21 preceding decision days and one following market open");
+    }
+    let mut scorer = NativeScorer::load(&bundle)?;
+    let mut warmup_scorer = NativeScorer::load(&warmup_bundle)?;
+    let mut prior_signals = Vec::with_capacity(21);
+    for decision_row in start - 22..start - 1 {
+        let source = if panel.market.dates[decision_row] < replay.start {
+            &mut warmup_scorer
+        } else {
+            &mut scorer
+        };
+        prior_signals.push(source.raw_weights(&panel, decision_row)?);
+    }
+    let mut prior = smooth_fixed_window(&prior_signals, 21)?;
+    let prior_volatility = panel.btc_vol20[..start]
+        .iter()
+        .map(|value| f64::from(*value))
+        .collect::<Vec<_>>();
+    apply_volatility_overlay(&mut prior, &prior_volatility, OverlayRules::default())?;
+    let mut equity = config.paper.initial_equity_usd;
+    let mut equity_points = Vec::with_capacity(end - start + 1);
+    let output = config
+        .storage
+        .ledger_path
+        .parent()
+        .context("ledger path has no parent directory")?
+        .join("historical_replay.csv");
+    let mut writer = csv::Writer::from_path(&output)
+        .with_context(|| format!("create replay output {}", output.display()))?;
+    writer.write_record(["date", "net_return", "turnover", "equity"])?;
+    let one_way_cost = config.paper.fee_bps / 10_000.0;
+    for row in start..=end {
+        let mut signals = Vec::with_capacity(21);
+        for decision_row in row - 21..row {
+            let source = if panel.market.dates[decision_row] < replay.start {
+                &mut warmup_scorer
+            } else {
+                &mut scorer
+            };
+            signals.push(source.raw_weights(&panel, decision_row)?);
+        }
+        let mut weights = smooth_fixed_window(&signals, 21)?;
+        let volatility = panel.btc_vol20[..=row]
+            .iter()
+            .map(|value| f64::from(*value))
+            .collect::<Vec<_>>();
+        apply_volatility_overlay(&mut weights, &volatility, OverlayRules::default())?;
+        let turnover = weights
+            .iter()
+            .zip(&prior)
+            .map(|(weight, old)| (weight - old).abs())
+            .sum::<f64>();
+        let gross_return = weights
+            .iter()
+            .zip(panel.oo_return.row(row))
+            .filter_map(|(weight, value)| value.is_finite().then_some(weight * f64::from(*value)))
+            .sum::<f64>();
+        let net_return = gross_return - one_way_cost * turnover;
+        equity *= 1.0 + net_return;
+        writer.serialize((panel.market.dates[row], net_return, turnover, equity))?;
+        equity_points.push(EquityPoint {
+            captured_at: utc_midnight(panel.market.dates[row]),
+            equity,
+            gross_notional: weights.iter().map(|weight| weight.abs()).sum::<f64>() * equity,
+            net_notional: weights.iter().sum::<f64>() * equity,
+        });
+        prior = weights;
+    }
+    writer.flush()?;
+    println!(
+        "historical replay {}..{} complete: equity=${equity:.6}; rows={}; output={}",
+        replay.start,
+        replay.end,
+        end - start + 1,
+        output.display(),
+    );
+    if let Some(reference) = replay.reference {
+        let (max_return_diff, max_turnover_diff) = compare_reference(&reference, &output)?;
+        println!(
+            "parity check: max_return_diff={max_return_diff:.3e}; max_turnover_diff={max_turnover_diff:.3e}"
+        );
+        if max_return_diff > 1e-6 || max_turnover_diff > 1e-6 {
+            bail!("historical replay differs from the Python reference beyond 1e-6")
+        }
+        println!("parity check: PASS");
+    }
+    Ok(ReplayRun {
+        account: AccountSnapshot {
+            session_id: "ranktrend-historical-replay".to_owned(),
+            captured_at: utc_midnight(replay.end),
+            cash: equity,
+            equity,
+            realized_pnl: equity - config.paper.initial_equity_usd,
+            unrealized_pnl: 0.0,
+            gross_notional: 0.0,
+            net_notional: 0.0,
+            fee_paid: 0.0,
+        },
+        last_decision_date: replay.end.to_string(),
+        equity: equity_points,
+    })
+}
+
+async fn serve_replay_dashboard(
+    address: SocketAddr,
+    bundle: BundleMetadata,
+    replay: ReplayRun,
+) -> Result<()> {
+    let state = ReplayAppState {
+        model: ModelView {
+            bundle_id: bundle.manifest.bundle_id,
+            backend: bundle.manifest.backend,
+            horizon_days: bundle.manifest.horizon_days,
+            cutoff_date: bundle.manifest.cutoff_date,
+            seed_count: bundle.manifest.models.len(),
+        },
+        account: replay.account,
+        last_decision_date: replay.last_decision_date,
+        equity: replay.equity,
+    };
+    let app = Router::new()
+        .route("/", get(dashboard))
+        .route("/health", get(health))
+        .route("/api/session", get(replay_session))
+        .route("/api/positions", get(replay_positions))
+        .route("/api/executions", get(replay_executions))
+        .route("/api/equity", get(replay_equity))
+        .route("/assets/styles.css", get(styles))
+        .route("/assets/app.js", get(app_js))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
+    println!("RankTrend historical replay dashboard: http://{address}");
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplayCsvRow {
+    date: NaiveDate,
+    net_return: f64,
+    turnover: f64,
+}
+
+fn compare_reference(reference: &PathBuf, output: &PathBuf) -> Result<(f64, f64)> {
+    let mut expected = BTreeMap::new();
+    for row in csv::Reader::from_path(reference)
+        .with_context(|| format!("open Python reference {}", reference.display()))?
+        .deserialize::<ReplayCsvRow>()
+    {
+        let row =
+            row.with_context(|| format!("decode Python reference {}", reference.display()))?;
+        expected.insert(row.date, row);
+    }
+    let mut max_return_diff = 0.0_f64;
+    let mut max_turnover_diff = 0.0_f64;
+    for row in csv::Reader::from_path(output)
+        .with_context(|| format!("open Rust replay output {}", output.display()))?
+        .deserialize::<ReplayCsvRow>()
+    {
+        let row = row.with_context(|| format!("decode Rust replay output {}", output.display()))?;
+        let expected = expected
+            .remove(&row.date)
+            .with_context(|| format!("Python reference has no row for {}", row.date))?;
+        max_return_diff = max_return_diff.max((row.net_return - expected.net_return).abs());
+        max_turnover_diff = max_turnover_diff.max((row.turnover - expected.turnover).abs());
+    }
+    Ok((max_return_diff, max_turnover_diff))
+}
+
 struct NativeScorer {
     _library: LightGbmLibrary,
     boosters: Vec<NativeBooster>,
@@ -727,7 +1030,7 @@ async fn session(State(state): State<AppState>) -> Json<SessionView> {
     Json(SessionView {
         status: runtime.status,
         detail: runtime.detail,
-        model_bundle: state.model_bundle.to_string(),
+        model: state.model.clone(),
         account: engine.snapshot(Utc::now()),
         last_decision_date: runtime.last_decision_date,
         last_error: runtime.last_error,
@@ -743,9 +1046,18 @@ async fn positions(State(state): State<AppState>) -> Json<Vec<PositionView>> {
             .into_iter()
             .map(|position| {
                 let unrealized_pnl = position.unrealized_pnl();
+                let notional = position.notional();
+                let side = if position.quantity >= 0.0 {
+                    "long".to_owned()
+                } else {
+                    "short".to_owned()
+                };
                 PositionView {
                     symbol: position.symbol,
+                    side,
                     quantity: position.quantity,
+                    notional,
+                    entry_price: position.entry_vwap,
                     mark_price: position.mark_price,
                     unrealized_pnl,
                 }
@@ -776,20 +1088,43 @@ async fn equity(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn dashboard() -> Html<&'static str> {
-    Html(include_str!("../assets/index.html"))
+async fn replay_session(State(state): State<ReplayAppState>) -> Json<SessionView> {
+    Json(SessionView {
+        status: "historical_replay".to_owned(),
+        detail: "Deterministic 1D OOS replay; no network data, order book, or slippage.".to_owned(),
+        model: state.model.clone(),
+        account: state.account.clone(),
+        last_decision_date: Some(state.last_decision_date.clone()),
+        last_error: None,
+    })
 }
 
-async fn dashboard_js() -> impl IntoResponse {
+async fn replay_positions() -> Json<Vec<PositionView>> {
+    Json(Vec::new())
+}
+
+async fn replay_executions() -> Json<Vec<rt_domain::ExecutionReport>> {
+    Json(Vec::new())
+}
+
+async fn replay_equity(State(state): State<ReplayAppState>) -> Json<Vec<EquityPoint>> {
+    Json(state.equity.clone())
+}
+
+async fn dashboard() -> Html<&'static str> {
+    Html(include_str!("../../ui/index.html"))
+}
+
+async fn styles() -> impl IntoResponse {
     (
-        [("content-type", "text/javascript; charset=utf-8")],
-        include_str!("../assets/dashboard.js"),
+        [("content-type", "text/css; charset=utf-8")],
+        include_str!("../../ui/styles.css"),
     )
 }
 
-async fn dashboard_wasm() -> impl IntoResponse {
+async fn app_js() -> impl IntoResponse {
     (
-        [("content-type", "application/wasm")],
-        include_bytes!("../assets/dashboard_bg.wasm").as_slice(),
+        [("content-type", "text/javascript; charset=utf-8")],
+        include_str!("../../ui/app.js"),
     )
 }

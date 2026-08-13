@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RankTrend / Paper</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="rail">
+        <a class="wordmark" href="/">RANK<span>TREND</span></a>
+        <nav>
+          <a class="active" href="#overview">Overview</a>
+          <a href="#positions">Positions</a>
+          <a href="#tape">Execution tape</a>
+          <a href="#model">Model</a>
+        </nav>
+        <div class="rail-foot" id="session-mode">PAPER / BYBIT LINEAR<br /><span>1D CLOSE ONLY</span></div>
+      </aside>
+      <section class="workbench" id="overview">
+        <header class="topbar">
+          <div><span class="eyebrow" id="mode-label">LIVE PAPER SESSION</span><h1>Daily ranking book</h1></div>
+          <div class="status"><i></i><span id="status">CONNECTING</span></div>
+        </header>
+        <section class="numbers" aria-label="Session metrics">
+          <div><span>Equity</span><strong id="equity">—</strong></div>
+          <div><span>Cash</span><strong id="cash">—</strong></div>
+          <div><span>Gross exposure</span><strong id="gross">—</strong></div>
+          <div><span>Model cut-off</span><strong id="cutoff">—</strong></div>
+        </section>
+        <section class="chart-panel">
+          <div class="panel-head"><div><span class="eyebrow">EQUITY</span><h2>Session curve</h2></div><span id="last-date">Awaiting first close</span></div>
+          <svg id="chart" viewBox="0 0 1000 260" preserveAspectRatio="none" aria-label="Equity curve"></svg>
+        </section>
+        <section class="split">
+          <div class="table-panel" id="positions">
+            <div class="panel-head"><div><span class="eyebrow">BOOK</span><h2>Current positions</h2></div><span id="position-count">0 instruments</span></div>
+            <table><thead><tr><th>Symbol</th><th>Side</th><th>Notional</th><th>Entry</th><th>Mark</th><th>Unrealized</th></tr></thead><tbody id="positions-body"><tr><td colspan="6" class="empty">No positions yet.</td></tr></tbody></table>
+          </div>
+          <div class="tape" id="tape"><div class="panel-head"><div><span class="eyebrow">LEDGER</span><h2>Execution tape</h2></div></div><ol id="events"><li class="empty">Waiting for the first daily rebalance.</li></ol></div>
+        </section>
+        <footer id="model" class="model-line">FROZEN ENSEMBLE <span id="model-info">Loading provenance…</span></footer>
+      </section>
+    </main>
+    <script src="/assets/app.js"></script>
+  </body>
+</html>
