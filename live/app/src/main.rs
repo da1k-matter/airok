@@ -138,6 +138,7 @@ struct PositionView {
     entry_price: f64,
     mark_price: f64,
     unrealized_pnl: f64,
+    opened_at: chrono::DateTime<Utc>,
 }
 
 #[tokio::main]
@@ -211,6 +212,7 @@ async fn main() -> Result<()> {
         .route("/api/executions", get(executions))
         .route("/api/equity", get(equity))
         .route("/assets/styles.css", get(styles))
+        .route("/assets/sort.css", get(sort_styles))
         .route("/assets/app.js", get(app_js))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -924,6 +926,7 @@ async fn serve_replay_dashboard(
         .route("/api/executions", get(replay_executions))
         .route("/api/equity", get(replay_equity))
         .route("/assets/styles.css", get(styles))
+        .route("/assets/sort.css", get(sort_styles))
         .route("/assets/app.js", get(app_js))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -1128,6 +1131,7 @@ async fn positions(State(state): State<AppState>) -> Json<Vec<PositionView>> {
                     entry_price: position.entry_vwap,
                     mark_price: position.mark_price,
                     unrealized_pnl,
+                    opened_at: position.opened_at,
                 }
             })
             .collect(),
@@ -1187,6 +1191,13 @@ async fn styles() -> impl IntoResponse {
     (
         [("content-type", "text/css; charset=utf-8")],
         include_str!("../../ui/styles.css"),
+    )
+}
+
+async fn sort_styles() -> impl IntoResponse {
+    (
+        [("content-type", "text/css; charset=utf-8")],
+        include_str!("../../ui/sort.css"),
     )
 }
 

@@ -1,0 +1,24 @@
+.sort-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+}
+
+.sort-button::after {
+  display: inline-block;
+  margin-left: 5px;
+  color: #6d6257;
+  font-size: 11px;
+  letter-spacing: 0;
+  content: '↕';
+}
+
+.sort-button[data-direction='asc']::after { color: var(--text); content: '↑'; }
+.sort-button[data-direction='desc']::after { color: var(--text); content: '↓'; }
+.sort-button:hover, .sort-button:focus-visible { color: var(--text); outline: 0; }
+.sort-button:focus-visible { box-shadow: 0 0 0 2px rgba(217, 150, 71, .45); border-radius: 2px; }

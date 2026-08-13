@@ -3,45 +3,79 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>RankTrend / Paper</title>
+    <meta name="theme-color" content="#0d0907" />
+    <title>RankTrend — Paper monitor</title>
     <link rel="stylesheet" href="/assets/styles.css" />
+    <link rel="stylesheet" href="/assets/sort.css" />
   </head>
   <body>
-    <main class="shell">
-      <aside class="rail">
-        <a class="wordmark" href="/">RANK<span>TREND</span></a>
-        <nav>
-          <a class="active" href="#overview">Overview</a>
-          <a href="#positions">Positions</a>
-          <a href="#tape">Execution tape</a>
-          <a href="#model">Model</a>
-        </nav>
-        <div class="rail-foot" id="session-mode">PAPER / BYBIT LINEAR<br /><span>1D CLOSE ONLY</span></div>
-      </aside>
-      <section class="workbench" id="overview">
-        <header class="topbar">
-          <div><span class="eyebrow" id="mode-label">LIVE PAPER SESSION</span><h1>Daily ranking book</h1></div>
-          <div class="status"><i></i><span id="status">CONNECTING</span></div>
-        </header>
-        <section class="numbers" aria-label="Session metrics">
-          <div><span>Equity</span><strong id="equity">—</strong></div>
-          <div><span>Cash</span><strong id="cash">—</strong></div>
-          <div><span>Gross exposure</span><strong id="gross">—</strong></div>
-          <div><span>Model cut-off</span><strong id="cutoff">—</strong></div>
-        </section>
-        <section class="chart-panel">
-          <div class="panel-head"><div><span class="eyebrow">EQUITY</span><h2>Session curve</h2></div><span id="last-date">Awaiting first close</span></div>
-          <div class="chart-wrap"><svg id="chart" viewBox="0 0 1000 320" preserveAspectRatio="none" aria-label="Equity curve"></svg><div id="chart-tooltip" class="chart-tooltip"></div></div>
-        </section>
-        <section class="split">
-          <div class="table-panel" id="positions">
-            <div class="panel-head"><div><span class="eyebrow">BOOK</span><h2>Current positions</h2></div><span id="position-count">0 instruments</span></div>
-            <table><thead><tr><th><button type="button" class="sort-button" data-sort-key="symbol">Symbol</button></th><th><button type="button" class="sort-button" data-sort-key="side">Side</button></th><th><button type="button" class="sort-button" data-sort-key="notional">Notional</button></th><th><button type="button" class="sort-button" data-sort-key="entry_price">Entry</button></th><th><button type="button" class="sort-button" data-sort-key="mark_price">Mark</button></th><th><button type="button" class="sort-button" data-sort-key="unrealized_pnl">Unrealized</button></th></tr></thead><tbody id="positions-body"><tr><td colspan="6" class="empty">No positions yet.</td></tr></tbody></table>
-          </div>
-          <div class="tape" id="tape"><div class="panel-head"><div><span class="eyebrow">LEDGER</span><h2>Execution tape</h2></div></div><ol id="events"><li class="empty">Waiting for the first daily rebalance.</li></ol></div>
-        </section>
-        <footer id="model" class="model-line">FROZEN ENSEMBLE <span id="model-info">Loading provenance…</span></footer>
+    <main class="workspace">
+      <header class="appbar">
+        <a class="brand" href="/"><span class="brand-mark">ranktrend</span><span class="brand-sub">Paper monitor</span></a>
+        <div class="app-status"><span class="status-pulse" id="live-dot"></span><span id="status">Connecting</span><span class="last-updated" id="last-updated"></span></div>
+      </header>
+
+      <section class="brief" aria-labelledby="page-title">
+        <p class="kicker" id="mode-label">Cross-sectional ranking / paper execution</p>
+        <h1 id="page-title">RankTrend Live</h1>
+        <p class="run-line" id="run-line">Loading the paper session.</p>
+        <div class="venue-list" aria-label="Execution venue"><span class="venue-tag">Bybit linear</span><span class="venue-tag">Daily close</span></div>
       </section>
+
+      <section class="metrics" aria-label="Session and performance metrics">
+        <div class="metric-group">
+          <div class="metric"><span class="metric-label">Equity</span><strong id="equity">—</strong></div>
+          <div class="metric"><span class="metric-label">Cash</span><strong id="cash">—</strong></div>
+          <div class="metric"><span class="metric-label">Gross exposure</span><strong id="gross">—</strong></div>
+          <div class="metric"><span class="metric-label">Net exposure</span><strong id="net">—</strong></div>
+          <div class="metric"><span class="metric-label">Model cut-off</span><strong id="cutoff">—</strong></div>
+        </div>
+        <div class="metric-group">
+          <div class="metric"><span class="metric-label">Realized P&amp;L</span><strong id="realized">—</strong></div>
+          <div class="metric"><span class="metric-label">Unrealized P&amp;L</span><strong id="unrealized">—</strong></div>
+          <div class="metric"><span class="metric-label">Fees paid</span><strong id="fees">—</strong></div>
+          <div class="metric"><span class="metric-label">Open positions</span><strong id="position-metric">—</strong></div>
+          <div class="metric"><span class="metric-label">Recorded trades</span><strong id="trade-metric">—</strong></div>
+        </div>
+      </section>
+
+      <nav class="main-nav" aria-label="Paper monitor sections">
+        <button class="nav-button active" data-view="positions-view">Positions <span class="nav-count" id="position-count">0</span></button>
+        <button class="nav-button" data-view="trades-view">Trades <span class="nav-count" id="trade-count">0</span></button>
+        <button class="nav-button" data-view="equity-view">Equity</button>
+      </nav>
+
+      <section class="view active" id="positions-view" aria-labelledby="positions-title">
+        <div class="section-top">
+          <div><h2 class="section-title" id="positions-title">Current positions</h2><p class="section-copy">Live paper holdings after the most recent confirmed daily rebalance. Prices are marked from the latest available execution snapshot.</p></div>
+          <div class="section-meta" id="positions-meta">Loading book</div>
+        </div>
+        <div class="data-table-wrap">
+          <table class="positions-table"><thead><tr><th><button type="button" class="sort-button" data-table="positions" data-sort-key="symbol">Instrument</button></th><th><button type="button" class="sort-button" data-table="positions" data-sort-key="side">Side</button></th><th class="num"><button type="button" class="sort-button" data-table="positions" data-sort-key="lot_pct">Lot (%)</button></th><th class="num"><button type="button" class="sort-button" data-table="positions" data-sort-key="notional">Quantity</button></th><th class="num"><button type="button" class="sort-button" data-table="positions" data-sort-key="entry_price">Entry</button></th><th class="num"><button type="button" class="sort-button" data-table="positions" data-sort-key="mark_price">Mark</button></th><th class="num"><button type="button" class="sort-button" data-table="positions" data-sort-key="unrealized_pnl">Unrealized P&amp;L</button></th><th class="num"><button type="button" class="sort-button" data-table="positions" data-sort-key="slippage_bps">Slippage</button></th><th><button type="button" class="sort-button" data-table="positions" data-sort-key="opened_at">Opened</button></th></tr></thead><tbody id="positions-body"></tbody></table>
+        </div>
+        <div class="empty" id="positions-empty">No open paper positions.</div>
+      </section>
+
+      <section class="view" id="trades-view" aria-labelledby="trades-title">
+        <div class="section-top">
+          <div><h2 class="section-title" id="trades-title">Trade history</h2><p class="section-copy">Most recent paper execution reports, including actual L2-derived fill price, fees and observed slippage.</p></div>
+          <div class="section-meta">Latest 100 executions</div>
+        </div>
+        <div class="data-table-wrap">
+          <table class="trades-table"><thead><tr><th><button type="button" class="sort-button" data-table="trades" data-sort-key="symbol">Instrument</button></th><th><button type="button" class="sort-button" data-table="trades" data-sort-key="side">Side</button></th><th class="num"><button type="button" class="sort-button" data-table="trades" data-sort-key="filled_quantity">Lot</button></th><th class="num"><button type="button" class="sort-button" data-table="trades" data-sort-key="vwap">Fill price</button></th><th class="num"><button type="button" class="sort-button" data-table="trades" data-sort-key="notional">Notional</button></th><th class="num"><button type="button" class="sort-button" data-table="trades" data-sort-key="fee">Fee</button></th><th class="num"><button type="button" class="sort-button" data-table="trades" data-sort-key="slippage_bps">Slippage</button></th><th><button type="button" class="sort-button" data-table="trades" data-sort-key="status">Status</button></th><th><button type="button" class="sort-button" data-table="trades" data-sort-key="executed_at">Executed</button></th><th><button type="button" class="sort-button" data-table="trades" data-sort-key="decision_id">Decision</button></th></tr></thead><tbody id="trades-body"></tbody></table>
+        </div>
+        <div class="empty" id="trades-empty">No recorded paper trades yet.</div>
+      </section>
+
+      <section class="view" id="equity-view" aria-labelledby="equity-title">
+        <div class="section-top">
+          <div><h2 class="section-title" id="equity-title">Equity curve</h2><p class="section-copy">Paper equity at each recorded account snapshot, inclusive of filled execution fees.</p></div>
+          <div class="section-meta" id="equity-meta">Awaiting first close</div>
+        </div>
+        <div class="chart-wrap"><svg id="chart" aria-label="Equity curve"></svg><div id="chart-tooltip" class="chart-tooltip"></div></div>
+      </section>
+
+      <footer class="footer"><span>RankTrend / paper execution monitor</span><span id="model-info">Loading immutable model provenance…</span></footer>
     </main>
     <script src="/assets/app.js"></script>
   </body>
