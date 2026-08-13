@@ -155,6 +155,7 @@ impl PaperEngine {
             rules,
             book,
             None,
+            None,
         )
     }
 
@@ -166,6 +167,7 @@ impl PaperEngine {
         symbol: &str,
         target_notional: f64,
         close_price: f64,
+        candle_closed_at: DateTime<Utc>,
         rules: &InstrumentRules,
         book: &OrderBookSnapshot,
     ) -> Result<Option<ExecutionReport>, EngineError> {
@@ -181,6 +183,7 @@ impl PaperEngine {
             rules,
             book,
             Some(close_price),
+            Some(candle_closed_at),
         )
     }
 
@@ -192,6 +195,7 @@ impl PaperEngine {
         rules: &InstrumentRules,
         book: &OrderBookSnapshot,
         entry_anchor: Option<f64>,
+        position_opened_at: Option<DateTime<Utc>>,
     ) -> Result<Option<ExecutionReport>, EngineError> {
         let mark = book.mid_price().ok_or_else(|| {
             EngineError::InvalidConfig("order book lacks a two-sided mid".to_owned())
@@ -240,7 +244,7 @@ impl PaperEngine {
                 self.config.execution.fee_bps,
             )?;
         }
-        self.apply_execution(&report, book.captured_at);
+        self.apply_execution(&report, position_opened_at.unwrap_or(book.captured_at));
         Ok(Some(report))
     }
 
@@ -354,7 +358,7 @@ fn round_down(value: f64, step: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
     use rt_domain::{InstrumentRules, OrderBookSnapshot, PriceLevel};
 
     use super::{PaperConfig, PaperEngine, RiskLimits};
@@ -435,12 +439,17 @@ mod tests {
                 quantity: 100.0,
             },
         ];
+        let candle_closed_at = Utc
+            .with_ymd_and_hms(2026, 8, 13, 0, 0, 0)
+            .single()
+            .expect("valid close timestamp");
         let report = engine
             .bootstrap_to_notional(
                 "bootstrap",
                 "BTCUSDT",
                 200.0,
                 100.0,
+                candle_closed_at,
                 &InstrumentRules {
                     symbol: "BTCUSDT".to_owned(),
                     status: "Trading".to_owned(),
@@ -462,6 +471,7 @@ mod tests {
             (report.slippage_bps.expect("impact") - (102.0 / 101.0 - 1.0) * 10_000.0).abs() < 1e-9
         );
         assert!((engine.positions()[0].entry_vwap - expected_entry).abs() < 1e-9);
+        assert_eq!(engine.positions()[0].opened_at, candle_closed_at);
     }
 
     #[test]
@@ -484,6 +494,7 @@ mod tests {
                 "BTCUSDT",
                 -200.0,
                 100.0,
+                impact_book.captured_at,
                 &InstrumentRules {
                     symbol: "BTCUSDT".to_owned(),
                     status: "Trading".to_owned(),

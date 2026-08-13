@@ -820,6 +820,14 @@ async fn decide_for_latest(
         config.bybit.rest_parallelism,
     )
     .await;
+    let bootstrap_closed_at = bootstrap_closes
+        .is_some()
+        .then(|| {
+            date.succ_opt()
+                .map(utc_midnight)
+                .context("bootstrap candle close timestamp overflows")
+        })
+        .transpose()?;
     for (symbol, notional, rules, book) in execution_inputs {
         if book.mid_price().is_none() {
             eprintln!("skip {symbol}: order-book snapshot is not two-sided");
@@ -835,6 +843,7 @@ async fn decide_for_latest(
                 &symbol,
                 notional,
                 close,
+                bootstrap_closed_at.expect("bootstrap close time is set"),
                 &rules,
                 &book,
             )?
