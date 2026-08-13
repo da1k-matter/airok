@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from ranktrend.research import build_features, make_targets
+from research import build_features, make_targets
 
 
 def test_feature_and_target_shapes():

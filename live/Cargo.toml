@@ -9,7 +9,7 @@ members = [
   "crates/rt-strategy",
   "crates/rt-engine",
   "crates/rt-dashboard",
-  "apps/ranktrend-paper",
+  "app",
 ]
 resolver = "3"
 

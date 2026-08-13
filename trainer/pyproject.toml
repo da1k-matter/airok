@@ -23,10 +23,12 @@ dependencies = [
 dev = ["pytest>=8", "ruff>=0.5"]
 
 [project.scripts]
-ranktrend = "ranktrend.cli:main"
+ranktrend = "cli:main"
+ranktrend-export = "export_bundle:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["cli", "config", "data", "export_bundle", "pipeline", "portfolio", "reporting", "research"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

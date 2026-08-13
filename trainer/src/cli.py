@@ -6,8 +6,8 @@ import logging
 import sys
 from pathlib import Path
 
-from .config import load_config
-from .pipeline import backtest, doctor, get_context, run, train_models
+from config import load_config
+from pipeline import backtest, doctor, get_context, run, train_models
 
 
 def configure_logging(verbose: bool = False) -> None:

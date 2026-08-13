@@ -182,7 +182,7 @@ async fn main() -> Result<()> {
 }
 
 fn parse_arguments() -> Result<(PathBuf, bool)> {
-    let mut config = PathBuf::from("configs/paper.toml");
+    let mut config = PathBuf::from("config/paper.toml");
     let mut once = false;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {

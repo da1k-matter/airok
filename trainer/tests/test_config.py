@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from ranktrend.config import load_config
+from config import load_config
 
 ROOT = Path(__file__).resolve().parents[1]
 

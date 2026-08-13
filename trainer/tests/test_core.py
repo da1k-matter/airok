@@ -1,14 +1,14 @@
 import numpy as np
 import pandas as pd
 
-from ranktrend.portfolio import (
+from portfolio import (
     _project_dollar_and_beta,
     average_portfolios,
     overlay_multiplier,
     smooth_fixed_window,
 )
-from ranktrend.reporting import metrics
-from ranktrend.research import aggregate_seed_ranks, rolling_rank_pct
+from reporting import metrics
+from research import aggregate_seed_ranks, rolling_rank_pct
 
 
 def test_rank_ties_use_average_percentile():

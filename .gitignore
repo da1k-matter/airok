@@ -18,6 +18,7 @@ target/
 **/data/
 **/outputs/
 models/
+live/state/
 *.html
 
 # Local archives

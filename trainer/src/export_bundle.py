@@ -10,9 +10,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ranktrend.config import ExperimentConfig, load_config
-from ranktrend.data import load_panel
-from ranktrend.research import build_features, make_targets, panel_to_rows
+from config import ExperimentConfig, load_config
+from data import load_panel
+from research import build_features, make_targets, panel_to_rows
 
 
 def canonical_json(value: object) -> bytes:
@@ -59,7 +59,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=Path("configs/lightgbm_h7.yaml"))
     parser.add_argument("--data", type=Path)
-    parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--bundle", type=Path, required=True, help="Destination under ../live/models/")
     arguments = parser.parse_args()
     if arguments.bundle.exists():
         raise SystemExit(f"refusing to overwrite existing bundle: {arguments.bundle}")

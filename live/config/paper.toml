@@ -2,7 +2,7 @@
 bundle = "models/lightgbm_h7_20260804_python"
 
 [data]
-directory = "data/1d"
+directory = "../trainer/data/1d"
 
 [paper]
 initial_equity_usd = 1000.0
@@ -15,7 +15,7 @@ reject_partial_fills = true
 bind = "127.0.0.1:8789"
 
 [storage]
-ledger_path = "data/live/ranktrend-paper.sqlite3"
+ledger_path = "state/paper/ranktrend-paper.sqlite3"
 
 [bybit]
 orderbook_depth = 50
