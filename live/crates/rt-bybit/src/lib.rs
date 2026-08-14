@@ -6,10 +6,13 @@ use rt_domain::{Candle, OrderBookSnapshot, PriceLevel};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
+use tokio::time::{self, Instant};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 const REST_URL: &str = "https://api.bybit.com";
 const WS_URL: &str = "wss://stream.bybit.com/v5/public/linear";
+const WS_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+const WS_MAX_SILENCE: std::time::Duration = std::time::Duration::from_secs(90);
 
 pub fn bybit_linear_symbol(base_symbol: &str) -> String {
     format!("{base_symbol}USDT")
@@ -250,24 +253,7 @@ impl BybitDailyWs {
         if let Some(candle) = self.pending.pop_front() {
             return Ok(candle);
         }
-        while let Some(message) = self.stream.next().await {
-            let message = message.context("read Bybit WebSocket frame")?;
-            match message {
-                Message::Text(text) => {
-                    if let Some(candle) = parse_ws_kline(&text, "kline.D.")? {
-                        return Ok(candle);
-                    }
-                }
-                Message::Ping(payload) => self
-                    .stream
-                    .send(Message::Pong(payload))
-                    .await
-                    .context("reply Bybit ping")?,
-                Message::Close(_) => bail!("Bybit public WebSocket closed"),
-                _ => {}
-            }
-        }
-        bail!("Bybit public WebSocket stream ended")
+        next_confirmed_kline(&mut self.stream, "kline.D.", "daily").await
     }
 }
 
@@ -325,23 +311,52 @@ impl BybitMinuteWs {
 
     /// Return a completed one-minute candle only; partial candles never alter paper marks.
     pub async fn next_confirmed_candle(&mut self) -> Result<Candle> {
-        while let Some(message) = self.stream.next().await {
-            match message.context("read Bybit minute WebSocket frame")? {
-                Message::Text(text) => {
-                    if let Some(candle) = parse_ws_kline(&text, "kline.1.")? {
-                        return Ok(candle);
-                    }
-                }
-                Message::Ping(payload) => self
-                    .stream
-                    .send(Message::Pong(payload))
+        next_confirmed_kline(&mut self.stream, "kline.1.", "minute").await
+    }
+}
+
+async fn next_confirmed_kline(
+    stream: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    topic_prefix: &str,
+    stream_name: &str,
+) -> Result<Candle> {
+    let mut heartbeat = time::interval(WS_HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let silence_deadline = time::sleep(WS_MAX_SILENCE);
+    tokio::pin!(silence_deadline);
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                stream
+                    .send(Message::Text(json!({ "op": "ping" }).to_string().into()))
                     .await
-                    .context("reply Bybit minute ping")?,
-                Message::Close(_) => bail!("Bybit public minute WebSocket closed"),
-                _ => {}
+                    .with_context(|| format!("send Bybit {stream_name} heartbeat"))?;
+            }
+            _ = &mut silence_deadline => {
+                bail!("Bybit {stream_name} WebSocket was silent for more than {} seconds", WS_MAX_SILENCE.as_secs());
+            }
+            message = stream.next() => {
+                let message = message
+                    .context("read Bybit WebSocket frame")?
+                    .context("Bybit public WebSocket stream ended")?;
+                silence_deadline
+                    .as_mut()
+                    .reset(Instant::now() + WS_MAX_SILENCE);
+                match message {
+                    Message::Text(text) => {
+                        if let Some(candle) = parse_ws_kline(&text, topic_prefix)? {
+                            return Ok(candle);
+                        }
+                    }
+                    Message::Ping(payload) => stream
+                        .send(Message::Pong(payload))
+                        .await
+                        .with_context(|| format!("reply Bybit {stream_name} WebSocket ping"))?,
+                    Message::Close(_) => bail!("Bybit {stream_name} WebSocket closed"),
+                    _ => {}
+                }
             }
         }
-        bail!("Bybit public minute WebSocket stream ended")
     }
 }
 

@@ -48,6 +48,14 @@ When a paper ledger already exists, the regular launch restores it and only wait
 cargo run --release -p ranktrend-paper -- --config config/paper.toml --no-bootstrap
 ```
 
+### Frozen ledger replay
+
+Use `--ledger-replay` with a copied SQLite ledger to inspect a past paper session in the dashboard without making any network requests or changing the copied ledger. This preserves the recorded execution reports, order-book snapshots, positions, and equity curve exactly as captured.
+
+```bash
+cargo run --release -p ranktrend-paper -- --config /path/to/replay.toml --ledger-replay
+```
+
 ## Historical OOS parity replay
 
 This short, isolated mode verifies Rust against an existing Python backtest over one complete 56-day walk-forward block. It uses local OHLCV only: no Bybit connection, order book, slippage, or live-paper ledger state. The previous fold is used only for the 21-day smoothing warm-up.

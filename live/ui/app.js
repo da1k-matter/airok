@@ -96,7 +96,10 @@ function renderPerformance(equity, initialEquity, metrics) {
 function renderPositions(rows, executions, equity) {
   latestPositions = rows;
   const latestSlippage = new Map();
-  executions.forEach(row => { if (!latestSlippage.has(row.symbol)) latestSlippage.set(row.symbol, row.slippage_bps); });
+  executions.forEach(row => {
+    const isFill = row.status === 'filled' || row.status === 'partial';
+    if (isFill && Number.isFinite(row.slippage_bps) && !latestSlippage.has(row.symbol)) latestSlippage.set(row.symbol, row.slippage_bps);
+  });
   const preparedRows = rows.map(row => ({ ...row, lot_pct: equity > 0 ? row.notional / equity * 100 : 0, slippage_bps: latestSlippage.get(row.symbol) }));
   const sortedRows = sortRows(preparedRows, 'positions');
   document.querySelector('#position-count').textContent = rows.length.toLocaleString(); document.querySelector('#positions-meta').textContent = rows.length ? `${rows.length} active instruments` : 'No active positions';

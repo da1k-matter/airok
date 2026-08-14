@@ -150,7 +150,7 @@ struct PositionView {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (config_path, once, replay, no_bootstrap) = parse_arguments()?;
+    let (config_path, once, replay, no_bootstrap, ledger_replay) = parse_arguments()?;
     let config = load_config(&config_path)?;
     let address: SocketAddr = config.server.bind.parse().context("parse server.bind")?;
     if let Some(replay) = replay {
@@ -176,10 +176,15 @@ async fn main() -> Result<()> {
     let engine = if let Some(state) = restored_state {
         PaperEngine::restore(paper_config, state)?
     } else {
+        if ledger_replay {
+            bail!("ledger replay requires an existing paper state");
+        }
         PaperEngine::new(PAPER_SESSION_ID.to_owned(), paper_config)?
     };
-    ledger.record_snapshot(&engine.snapshot(Utc::now()))?;
-    ledger.save_engine_state(&engine.persistent_state(), Utc::now())?;
+    if !ledger_replay {
+        ledger.record_snapshot(&engine.snapshot(Utc::now()))?;
+        ledger.save_engine_state(&engine.persistent_state(), Utc::now())?;
+    }
     let state = AppState {
         engine: Arc::new(Mutex::new(engine)),
         ledger: Arc::new(Mutex::new(ledger)),
@@ -191,28 +196,39 @@ async fn main() -> Result<()> {
             cutoff_date: bundle.manifest.cutoff_date,
             seed_count: bundle.manifest.models.len(),
         },
-        runtime: Arc::new(Mutex::new(RuntimeStatus {
-            last_decision_date,
-            ..RuntimeStatus::booting()
+        runtime: Arc::new(Mutex::new(if ledger_replay {
+            RuntimeStatus {
+                status: "ledger_replay".to_owned(),
+                detail: "Read-only replay from a frozen paper ledger snapshot.".to_owned(),
+                last_decision_date,
+                last_error: None,
+            }
+        } else {
+            RuntimeStatus {
+                last_decision_date,
+                ..RuntimeStatus::booting()
+            }
         })),
     };
     if once {
         run_previous_day_bootstrap(state.clone(), config).await?;
         return Ok(());
     }
-    if !bootstrap_previous_day {
+    if !bootstrap_previous_day && !ledger_replay {
         set_status(
             &state,
             "waiting_for_daily_close",
             "Waiting for a confirmed 1D close.",
         );
     }
-    tokio::spawn(run_live_loop(
-        state.clone(),
-        config.clone(),
-        bootstrap_previous_day,
-    ));
-    tokio::spawn(run_open_position_mark_loop(state.clone(), config));
+    if !ledger_replay {
+        tokio::spawn(run_live_loop(
+            state.clone(),
+            config.clone(),
+            bootstrap_previous_day,
+        ));
+        tokio::spawn(run_open_position_mark_loop(state.clone(), config));
+    }
     let app = Router::new()
         .route("/", get(dashboard))
         .route("/health", get(health))
@@ -256,7 +272,7 @@ struct ReplayRun {
     equity: Vec<EquityPoint>,
 }
 
-fn parse_arguments() -> Result<(PathBuf, bool, Option<ReplayRequest>, bool)> {
+fn parse_arguments() -> Result<(PathBuf, bool, Option<ReplayRequest>, bool, bool)> {
     let mut config = PathBuf::from("config/paper.toml");
     let mut once = false;
     let mut replay_start = None;
@@ -265,6 +281,7 @@ fn parse_arguments() -> Result<(PathBuf, bool, Option<ReplayRequest>, bool)> {
     let mut warmup_bundle = None;
     let mut reference = None;
     let mut no_bootstrap = false;
+    let mut ledger_replay = false;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -273,6 +290,7 @@ fn parse_arguments() -> Result<(PathBuf, bool, Option<ReplayRequest>, bool)> {
             }
             "--once" => once = true,
             "--no-bootstrap" => no_bootstrap = true,
+            "--ledger-replay" => ledger_replay = true,
             "--replay-start" => {
                 replay_start = Some(NaiveDate::parse_from_str(
                     &arguments.next().context("missing --replay-start date")?,
@@ -327,7 +345,12 @@ fn parse_arguments() -> Result<(PathBuf, bool, Option<ReplayRequest>, bool)> {
     if replay.is_some() && no_bootstrap {
         bail!("--no-bootstrap cannot be combined with historical replay")
     }
-    Ok((config, once, replay, no_bootstrap))
+    if ledger_replay && (once || replay.is_some() || no_bootstrap) {
+        bail!(
+            "--ledger-replay cannot be combined with --once, historical replay, or --no-bootstrap"
+        )
+    }
+    Ok((config, once, replay, no_bootstrap, ledger_replay))
 }
 
 fn should_bootstrap_previous_day(fresh_paper_ledger: bool, no_bootstrap: bool) -> bool {
