@@ -58,7 +58,7 @@ pub enum StrategyError {
     InvalidRule(String),
 }
 
-pub fn ranktrend_feature_names() -> Vec<String> {
+pub fn airok_feature_names() -> Vec<String> {
     let raw = [
         "ret_1",
         "ret_2",
@@ -399,12 +399,12 @@ fn project_dollar_and_beta(weights: &mut [f64], beta: &[f64]) {
 mod tests {
     use super::{
         OverlayRules, PortfolioRules, apply_volatility_overlay, build_daily_weights,
-        cross_section_rank_percentile, median_rank_ensemble, ranktrend_feature_names,
+        airok_feature_names, cross_section_rank_percentile, median_rank_ensemble,
     };
 
     #[test]
-    fn feature_contract_matches_current_ranktrend_width() {
-        let names = ranktrend_feature_names();
+    fn feature_contract_matches_current_airok_width() {
+        let names = airok_feature_names();
         assert_eq!(names.len(), 42);
         assert_eq!(names.first().expect("first"), "ret_1_xrank");
         assert_eq!(names.last().expect("last"), "mkt_dispersion");

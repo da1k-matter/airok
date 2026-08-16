@@ -4,41 +4,34 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#0d0907" />
-    <title>rtrend</title>
+    <title>airōk</title>
     <link rel="stylesheet" href="/assets/styles.css" />
     <link rel="stylesheet" href="/assets/sort.css" />
   </head>
   <body>
     <main class="workspace">
       <header class="appbar">
-        <a class="brand" href="/"><span class="brand-mark">ranktrend</span></a>
-        <div class="app-status"><span class="status-pulse" id="live-dot"></span><span id="status">Connecting</span><span class="last-updated" id="last-updated"></span></div>
+        <a class="brand" href="/"><span class="brand-mark">airōk</span></a>
+        <div class="app-status">
+          <span class="status-message typewriter" id="mode-label" aria-live="off">Δx · Δp ≥ ħ / 2 — certainty has a cost.</span>
+        </div>
       </header>
 
-      <section class="brief" aria-labelledby="page-title">
-        <p class="kicker" id="mode-label">Cross-sectional crypto ranking</p>
-        <h1 id="page-title">RankTrend Live</h1>
-      </section>
-
       <section class="metrics" aria-label="Session and performance metrics">
-        <div class="metric-group">
-          <div class="metric"><span class="metric-label">Equity</span><strong id="equity">—</strong></div>
-          <div class="metric metric-pnl"><span class="metric-label">Total P&amp;L</span><strong id="total-pnl">—</strong><span class="metric-detail" id="total-pnl-return">—</span></div>
-          <div class="metric"><span class="metric-label">Max drawdown (all minute marks)</span><strong id="max-drawdown">—</strong></div>
-          <div class="metric"><span class="metric-label">Sharpe (minute equity returns)</span><strong id="sharpe">—</strong></div>
-        </div>
-        <div class="metric-group">
-          <div class="metric"><span class="metric-label">Profit factor (closed trades)</span><strong id="profit-factor">—</strong></div>
-          <div class="metric"><span class="metric-label">Win rate (closed trades)</span><strong id="win-rate">—</strong></div>
-          <div class="metric"><span class="metric-label">Average minute return</span><strong id="average-return">—</strong></div>
-          <div class="metric"><span class="metric-label">Fees paid</span><strong id="fees">—</strong></div>
-        </div>
+        <article class="metric metric-lead" data-chart="equity" data-tone="neutral" role="button" tabindex="0" aria-controls="chart-view"><header><span class="metric-label">Equity</span><strong id="equity">—</strong></header><canvas class="metric-chart" data-series="equity" aria-label="Equity history"></canvas><span class="metric-caption" id="equity-range">Session curve</span></article>
+        <article class="metric metric-lead" data-chart="pnl" data-tone="positive" role="button" tabindex="0" aria-controls="chart-view"><header><span class="metric-label">Total P&amp;L</span><strong id="total-pnl">—</strong><span class="metric-detail" id="total-pnl-return">—</span></header><canvas class="metric-chart" data-series="pnl" aria-label="Profit and loss history"></canvas><span class="metric-caption">Since inception</span></article>
+        <article class="metric" data-chart="drawdown" data-tone="negative" role="button" tabindex="0" aria-controls="chart-view"><header><span class="metric-label">Max drawdown</span><strong id="max-drawdown">—</strong></header><canvas class="metric-chart" data-series="drawdown" aria-label="Drawdown history"></canvas><span class="metric-caption">All minute marks</span></article>
+        <article class="metric" data-chart="sharpe" data-tone="positive" role="button" tabindex="0" aria-controls="chart-view"><header><span class="metric-label">Sharpe</span><strong id="sharpe">—</strong></header><canvas class="metric-chart" data-series="sharpe" aria-label="Rolling Sharpe history"></canvas><span class="metric-caption">Minute equity returns</span></article>
+        <article class="metric metric-compact" data-chart="profit-factor" data-tone="neutral" role="button" tabindex="0" aria-controls="chart-view"><header><span class="metric-label">Profit factor</span><strong id="profit-factor">—</strong></header><canvas class="metric-chart" data-series="empty" aria-label="Profit factor history unavailable"></canvas><span class="metric-caption">Closed trades</span></article>
+        <article class="metric metric-compact" data-chart="win-rate" data-tone="neutral" role="button" tabindex="0" aria-controls="chart-view"><header><span class="metric-label">Win rate</span><strong id="win-rate">—</strong></header><canvas class="metric-chart" data-series="empty" aria-label="Win rate history unavailable"></canvas><span class="metric-caption">Closed trades</span></article>
+        <article class="metric metric-compact" data-chart="returns" data-tone="positive" role="button" tabindex="0" aria-controls="chart-view"><header><span class="metric-label">Average minute return</span><strong id="average-return">—</strong></header><canvas class="metric-chart" data-series="returns" aria-label="Rolling average return history"></canvas><span class="metric-caption">Rolling mean</span></article>
+        <article class="metric metric-compact" data-chart="fees" data-tone="warning" role="button" tabindex="0" aria-controls="chart-view"><header><span class="metric-label">Fees paid</span><strong id="fees">—</strong></header><canvas class="metric-chart" data-series="fees" aria-label="Cumulative fee history"></canvas><span class="metric-caption">Execution cost</span></article>
       </section>
 
       <nav class="main-nav" aria-label="Paper monitor sections">
         <button class="nav-button active" data-view="positions-view">Positions <span class="nav-count" id="position-count">0</span></button>
         <button class="nav-button" data-view="trades-view">Executions <span class="nav-count" id="trade-count">0</span></button>
-        <button class="nav-button" data-view="equity-view">Equity</button>
+        <button class="nav-button" data-view="chart-view">Chart</button>
       </nav>
 
       <section class="view active" id="positions-view" aria-labelledby="positions-title">
@@ -63,15 +56,15 @@
         <div class="empty" id="trades-empty">No recorded paper trades yet.</div>
       </section>
 
-      <section class="view" id="equity-view" aria-labelledby="equity-title">
+      <section class="view" id="chart-view" aria-labelledby="chart-title">
         <div class="section-top">
-          <div><h2 class="section-title" id="equity-title">Equity curve</h2><p class="section-copy">Every stored UTC-minute mark-to-market point. Dense history is rendered with extrema-preserving buckets while the complete minute series remains in SQLite.</p></div>
-          <div class="section-meta" id="equity-meta">Awaiting first close</div>
+          <div><h2 class="section-title" id="chart-title">Equity curve</h2><p class="section-copy" id="chart-copy">Every stored UTC-minute mark-to-market point. Dense history is rendered with extrema-preserving buckets while the complete minute series remains in SQLite.</p></div>
+          <div class="section-meta" id="chart-meta">Awaiting first close</div>
         </div>
         <div class="chart-wrap"><canvas id="chart" aria-label="Equity curve"></canvas><div id="chart-tooltip" class="chart-tooltip"></div></div>
       </section>
 
-      <footer class="footer"><span>RankTrend / paper execution monitor</span><span id="model-info">Loading immutable model provenance…</span></footer>
+      <footer class="footer"><span>Paper execution monitor</span><span id="model-info">Loading immutable model provenance…</span></footer>
     </main>
     <script src="/assets/app.js"></script>
   </body>

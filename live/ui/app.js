@@ -14,19 +14,124 @@ let latestPositions = [];
 let latestTrades = [];
 let currentEquity = 0;
 let latestMetrics = {};
+let sessionInitialEquity = 0;
+let sessionFees = 0;
 let totalEquityPoints = 0;
 let nextCurveRefresh = 0;
+let selectedChart = 'equity';
 const sorting = {
   positions: { key: 'symbol', direction: 'asc' },
   trades: { key: 'executed_at', direction: 'desc' },
 };
 
-document.querySelectorAll('.nav-button').forEach(button => button.addEventListener('click', () => {
-  const viewId = button.dataset.view;
+const terminalPhrases = [
+  'Δx · Δp ≥ ħ / 2 — certainty has a cost.',
+  '|Ψ⟩ = (|00⟩ + |11⟩) / √2 — distance is not separation.',
+  'S = k_B ln Ω — disorder is possibility counted honestly.',
+  'We observe the light; dark matter keeps the ledger.',
+  'The vacuum is not empty. It is restless.',
+  'Quarks are never alone. Perhaps facts are not either.',
+  'The arrow of time may be the price of remembering.',
+  'Every measurement is a question asked in public.',
+  'The universe is unfinished, and so is the observer.',
+  'c is constant. Everything else is learning to change.',
+];
+
+const typewriter = document.querySelector('#mode-label');
+const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+const terminalError = 'Error: dashboard API unreachable.';
+let terminalMode = null;
+let terminalRun = 0;
+
+const sleep = milliseconds => new Promise(resolve => window.setTimeout(resolve, milliseconds));
+
+async function typePhrase(phrase, run) {
+  typewriter.textContent = '';
+  for (const character of phrase) {
+    if (run !== terminalRun) return false;
+    typewriter.textContent += character;
+    await sleep(character === ' ' ? 38 : 34 + Math.round(Math.random() * 32));
+  }
+  return run === terminalRun;
+}
+
+async function erasePhrase(run) {
+  while (typewriter.textContent.length > 0) {
+    if (run !== terminalRun) return false;
+    typewriter.textContent = typewriter.textContent.slice(0, -1);
+    await sleep(18 + Math.round(Math.random() * 18));
+  }
+  return run === terminalRun;
+}
+
+async function runPhraseCycle(run) {
+  let phraseIndex = 0;
+  typewriter.textContent = '';
+  await sleep(420);
+  while (run === terminalRun && terminalMode === 'normal' && !reduceMotion.matches) {
+    if (!await typePhrase(terminalPhrases[phraseIndex], run)) return;
+    await sleep(3600 + Math.round(Math.random() * 1100));
+    if (!await erasePhrase(run)) return;
+    await sleep(360);
+    phraseIndex = (phraseIndex + 1) % terminalPhrases.length;
+  }
+}
+
+async function runErrorMessage(run) {
+  typewriter.textContent = '';
+  await sleep(160);
+  await typePhrase(terminalError, run);
+}
+
+function restartTerminal() {
+  const run = ++terminalRun;
+  typewriter.classList.toggle('typewriter-error', terminalMode === 'error');
+  if (reduceMotion.matches) {
+    typewriter.textContent = terminalMode === 'error' ? terminalError : terminalPhrases[0];
+    return;
+  }
+  if (terminalMode === 'error') runErrorMessage(run);
+  else runPhraseCycle(run);
+}
+
+function setTerminalMode(mode) {
+  if (terminalMode === mode) return;
+  terminalMode = mode;
+  restartTerminal();
+}
+
+reduceMotion.addEventListener('change', restartTerminal);
+
+setTerminalMode('normal');
+
+function openView(viewId) {
+  const button = document.querySelector(`.nav-button[data-view="${viewId}"]`);
   document.querySelectorAll('.nav-button').forEach(item => item.classList.toggle('active', item === button));
   document.querySelectorAll('.view').forEach(view => view.classList.toggle('active', view.id === viewId));
-  if (viewId === 'equity-view') requestAnimationFrame(() => drawChart(latestEquity));
-}));
+  if (viewId === 'chart-view') requestAnimationFrame(drawSelectedChart);
+}
+
+document.querySelectorAll('.nav-button').forEach(button => button.addEventListener('click', () => openView(button.dataset.view)));
+
+function selectMetricChart(metric) {
+  selectedChart = metric.dataset.chart;
+  document.querySelectorAll('.metric').forEach(item => {
+    const selected = item === metric;
+    item.classList.toggle('selected', selected);
+    item.setAttribute('aria-pressed', String(selected));
+  });
+  openView('chart-view');
+  document.querySelector('#chart-view').scrollIntoView({ behavior: reduceMotion.matches ? 'auto' : 'smooth', block: 'start' });
+}
+
+document.querySelectorAll('.metric[data-chart]').forEach(metric => {
+  metric.setAttribute('aria-pressed', 'false');
+  metric.addEventListener('click', () => selectMetricChart(metric));
+  metric.addEventListener('keydown', event => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault(); selectMetricChart(metric);
+  });
+});
 
 document.querySelectorAll('.sort-button').forEach(button => button.addEventListener('click', () => {
   const table = button.dataset.table, state = sorting[table], key = button.dataset.sortKey;
@@ -63,6 +168,114 @@ function drawChart(rows) {
   canvas.onmouseleave = () => { tip.style.opacity = '0'; };
 }
 
+const chartDefinitions = {
+  equity: { title: 'Equity curve', copy: 'Every stored UTC-minute mark-to-market point. Dense history preserves the extrema while the complete minute series remains in SQLite.', tone: '#d99647', format: money },
+  pnl: { title: 'Total P&L', copy: 'Cumulative profit and loss measured from the persisted session starting equity.', tone: '#4fc494', format: signedMoney },
+  drawdown: { title: 'Max drawdown', copy: 'Distance from the running equity peak across every stored minute mark.', tone: '#e8716d', format: percent },
+  sharpe: { title: 'Rolling Sharpe', copy: 'Annualized rolling Sharpe estimated from minute equity returns.', tone: '#4fc494', format: value => value.toFixed(2) },
+  'profit-factor': { title: 'Profit factor', copy: 'Gross closed-trade profit divided by gross closed-trade loss.', tone: '#d99647', format: value => value.toFixed(2), unavailable: true },
+  'win-rate': { title: 'Win rate', copy: 'Share of closed trades finishing with positive realized P&L.', tone: '#d99647', format: value => `${(value * 100).toFixed(1)}%`, unavailable: true },
+  returns: { title: 'Average minute return', copy: 'Rolling mean of minute-to-minute equity returns.', tone: '#4fc494', format: percent },
+  fees: { title: 'Fees paid', copy: 'Cumulative execution fees from the available paper execution reports.', tone: '#d99a4d', format: money },
+};
+
+function selectedSeries(kind) {
+  if (kind === 'profit-factor' || kind === 'win-rate') return [];
+  if (kind === 'fees') {
+    const fees = [...latestTrades].filter(row => Number.isFinite(row.fee) && row.fee > 0).sort((a, b) => new Date(a.executed_at) - new Date(b.executed_at));
+    let cumulative = Math.max(0, sessionFees - fees.reduce((sum, row) => sum + row.fee, 0));
+    return fees.map(row => ({ value: cumulative += row.fee, captured_at: row.executed_at }));
+  }
+  const values = metricSeries(kind);
+  const offset = kind === 'returns' || kind === 'sharpe' ? 1 : 0;
+  return values.map((value, index) => ({ value, captured_at: latestEquity[index + offset]?.captured_at }));
+}
+
+function drawSeriesChart(rows, definition) {
+  const canvas = document.querySelector('#chart'), tip = document.querySelector('#chart-tooltip');
+  const { context, W, H, L, R, T, B, plotW, plotH } = chartFrame(canvas);
+  if (rows.length < 2) { tip.style.opacity = '0'; return; }
+  const values = rows.map(row => row.value), low = Math.min(...values), high = Math.max(...values), span = high - low || Math.max(Math.abs(high), 1), pad = span * .12, min = low - pad, max = high + pad, range = max - min;
+  const x = index => L + index / Math.max(rows.length - 1, 1) * plotW, y = value => T + (max - value) / range * plotH;
+  context.strokeStyle = '#29211d'; context.fillStyle = '#7e7068'; context.font = '11px ui-monospace, monospace'; context.lineWidth = 1;
+  for (let index = 0; index < 5; index += 1) { const value = min + range * index / 4, yy = y(value); context.beginPath(); context.moveTo(L, yy); context.lineTo(W - R, yy); context.stroke(); context.textAlign = 'right'; context.fillText(definition.format(value), L - 12, yy + 4); }
+  const gradient = context.createLinearGradient(0, T, 0, T + plotH); gradient.addColorStop(0, `${definition.tone}42`); gradient.addColorStop(1, `${definition.tone}00`);
+  context.beginPath(); context.moveTo(x(0), T + plotH); rows.forEach((row, index) => context.lineTo(x(index), y(row.value))); context.lineTo(x(rows.length - 1), T + plotH); context.closePath(); context.fillStyle = gradient; context.fill();
+  context.beginPath(); rows.forEach((row, index) => index ? context.lineTo(x(index), y(row.value)) : context.moveTo(x(index), y(row.value))); context.strokeStyle = definition.tone; context.lineWidth = 2.25; context.stroke();
+  context.fillStyle = '#7e7068'; context.textAlign = 'left'; context.fillText(timestamp(rows[0].captured_at), L, H - 15); context.textAlign = 'center'; context.fillText(`${rows.length.toLocaleString()} plotted points`, W / 2, H - 15); context.textAlign = 'right'; context.fillText(timestamp(rows.at(-1).captured_at), W - R, H - 15);
+  canvas.onmousemove = event => { const rect = canvas.getBoundingClientRect(), index = Math.max(0, Math.min(rows.length - 1, Math.round(((event.clientX - rect.left - L) / plotW) * (rows.length - 1)))), row = rows[index], cx = x(index), cy = y(row.value); tip.innerHTML = `${timestamp(row.captured_at)}<br><strong style="color:${definition.tone}">${definition.format(row.value)}</strong>`; tip.style.left = `${Math.max(72, Math.min(W - 72, cx)) / W * 100}%`; tip.style.top = `${Math.max(42, cy) / H * 100}%`; tip.style.opacity = '1'; };
+  canvas.onmouseleave = () => { tip.style.opacity = '0'; };
+}
+
+function drawSelectedChart() {
+  const definition = chartDefinitions[selectedChart];
+  document.querySelector('#chart-title').textContent = definition.title;
+  document.querySelector('#chart-copy').textContent = definition.copy;
+  if (selectedChart === 'equity') {
+    document.querySelector('#chart-meta').textContent = totalEquityPoints ? `${totalEquityPoints.toLocaleString()} stored points` : 'Awaiting first close';
+    drawChart(latestEquity);
+    return;
+  }
+  const rows = selectedSeries(selectedChart);
+  document.querySelector('#chart-meta').textContent = rows.length ? `${rows.length.toLocaleString()} plotted points` : 'Awaiting closed trades';
+  drawSeriesChart(rows, definition);
+}
+
+function metricSeries(kind) {
+  const equities = latestEquity.map(row => Number(row.equity)).filter(Number.isFinite);
+  if (!equities.length) return [];
+  if (kind === 'equity') return equities;
+  if (kind === 'pnl') return equities.map(value => value - sessionInitialEquity);
+  if (kind === 'drawdown') {
+    let peak = equities[0];
+    return equities.map(value => { peak = Math.max(peak, value); return peak ? (value - peak) / peak : 0; });
+  }
+  const returns = equities.slice(1).map((value, index) => equities[index] ? value / equities[index] - 1 : 0);
+  const rolling = (values, windowSize, mapper) => values.map((_, index) => mapper(values.slice(Math.max(0, index - windowSize + 1), index + 1)));
+  if (kind === 'returns') return rolling(returns, 30, values => values.reduce((sum, value) => sum + value, 0) / values.length);
+  if (kind === 'sharpe') return rolling(returns, 60, values => {
+    if (values.length < 2) return 0;
+    const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+    const variance = values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (values.length - 1);
+    return variance > 0 ? mean / Math.sqrt(variance) * Math.sqrt(365 * 24 * 60) : 0;
+  });
+  if (kind === 'fees') {
+    const fees = [...latestTrades].filter(row => Number.isFinite(row.fee) && row.fee > 0).sort((a, b) => new Date(a.executed_at) - new Date(b.executed_at));
+    let cumulative = Math.max(0, sessionFees - fees.reduce((sum, row) => sum + row.fee, 0));
+    return fees.map(row => { cumulative += row.fee; return cumulative; });
+  }
+  return [];
+}
+
+function drawMetricChart(canvas) {
+  const values = metricSeries(canvas.dataset.series);
+  const { width, height } = canvas.getBoundingClientRect();
+  const ratio = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.max(1, Math.round(width * ratio)); canvas.height = Math.max(1, Math.round(height * ratio));
+  const context = canvas.getContext('2d'); context.setTransform(ratio, 0, 0, ratio, 0, 0); context.clearRect(0, 0, width, height);
+  const tone = canvas.closest('.metric').dataset.tone;
+  const colors = { positive: '#4fc494', negative: '#e8716d', warning: '#d99a4d', neutral: '#d99647' };
+  const color = colors[tone] || colors.neutral;
+  if (values.length < 2 || canvas.dataset.series === 'empty') {
+    context.setLineDash([3, 5]); context.strokeStyle = 'rgba(244,235,221,.12)'; context.lineWidth = 1;
+    context.beginPath(); context.moveTo(0, height * .66); context.lineTo(width, height * .66); context.stroke();
+    return;
+  }
+  const min = Math.min(...values), max = Math.max(...values), range = max - min || Math.max(Math.abs(max), 1), padX = 1, padY = 8;
+  const x = index => padX + index / (values.length - 1) * (width - padX * 2);
+  const y = value => padY + (max - value) / range * (height - padY * 2);
+  const gradient = context.createLinearGradient(0, 0, 0, height); gradient.addColorStop(0, `${color}38`); gradient.addColorStop(1, `${color}00`);
+  context.beginPath(); context.moveTo(x(0), height); values.forEach((value, index) => context.lineTo(x(index), y(value))); context.lineTo(x(values.length - 1), height); context.closePath(); context.fillStyle = gradient; context.fill();
+  context.beginPath(); values.forEach((value, index) => index ? context.lineTo(x(index), y(value)) : context.moveTo(x(index), y(value)));
+  context.strokeStyle = color; context.lineWidth = 1.45; context.globalAlpha = .82; context.stroke(); context.globalAlpha = 1;
+  const lastX = x(values.length - 1), lastY = y(values.at(-1));
+  context.beginPath(); context.arc(lastX, lastY, 2.6, 0, Math.PI * 2); context.fillStyle = color; context.fill();
+}
+
+function drawMetricCharts() {
+  document.querySelectorAll('.metric-chart').forEach(drawMetricChart);
+}
+
 function renderSortIndicators(table) {
   const state = sorting[table];
   document.querySelectorAll(`.sort-button[data-table="${table}"]`).forEach(button => {
@@ -91,6 +304,7 @@ function renderPerformance(equity, initialEquity, metrics) {
   set('#profit-factor', Number.isFinite(metrics.profit_factor) ? metrics.profit_factor.toFixed(2) : '—', classFor((metrics.profit_factor ?? 1) - 1));
   set('#win-rate', Number.isFinite(metrics.win_rate) ? `${(metrics.win_rate * 100).toFixed(1)}%` : '—', classFor((metrics.win_rate ?? .5) - .5));
   set('#average-return', Number.isFinite(metrics.average_return) ? percent(metrics.average_return) : '—', classFor(metrics.average_return));
+  requestAnimationFrame(drawMetricCharts);
 }
 
 function renderPositions(rows, executions, equity) {
@@ -126,10 +340,10 @@ async function refresh() {
     const payloads = await Promise.all(urls.map(url => fetch(url, { cache: 'no-store' }).then(response => { if (!response.ok) throw new Error(`${url} unavailable`); return response.json(); })));
     const [session, positions, executions, curve] = payloads;
     if (curve) { latestEquity = curve.points; latestMetrics = curve.metrics; totalEquityPoints = curve.total_points; nextCurveRefresh = now + 15000; }
-    const account = session.account, replay = session.status === 'historical_replay';
-    document.querySelector('#live-dot').classList.remove('offline'); document.querySelector('#status').textContent = session.status.replaceAll('_', ' ').toUpperCase(); document.querySelector('#last-updated').textContent = '3s refresh'; document.querySelector('#mode-label').textContent = replay ? 'Historical OOS replay / frozen model' : 'Cross-sectional crypto ranking';
-    document.querySelector('#equity').textContent = money(account.equity); document.querySelector('#fees').textContent = money(account.fee_paid); document.querySelector('#equity-meta').textContent = session.last_decision_date || 'Awaiting first close'; document.querySelector('#model-info').textContent = `Frozen ${session.model.backend.toUpperCase()} ensemble · h${session.model.horizon_days} · ${session.model.seed_count} seeds · cut-off ${session.model.cutoff_date}`;
-    currentEquity = account.equity; renderPerformance(currentEquity, session.session_start_equity_usd, latestMetrics); renderTrades(executions); renderPositions(positions, executions, currentEquity); if (curve && document.querySelector('#equity-view').classList.contains('active')) drawChart(latestEquity);
-  } catch (_) { document.querySelector('#live-dot').classList.add('offline'); document.querySelector('#status').textContent = 'API UNAVAILABLE'; document.querySelector('#last-updated').textContent = 'Retrying'; }
+    const account = session.account;
+    setTerminalMode('normal');
+    document.querySelector('#equity').textContent = money(account.equity); document.querySelector('#fees').textContent = money(account.fee_paid); document.querySelector('#model-info').textContent = `Frozen ${session.model.backend.toUpperCase()} ensemble · h${session.model.horizon_days} · ${session.model.seed_count} seeds · cut-off ${session.model.cutoff_date}`;
+    sessionInitialEquity = session.session_start_equity_usd; sessionFees = account.fee_paid; currentEquity = account.equity; renderPerformance(currentEquity, sessionInitialEquity, latestMetrics); renderTrades(executions); renderPositions(positions, executions, currentEquity); if (document.querySelector('#chart-view').classList.contains('active')) drawSelectedChart();
+  } catch (_) { setTerminalMode('error'); }
 }
-refresh(); setInterval(refresh, 3000); window.addEventListener('resize', () => { if (document.querySelector('#equity-view').classList.contains('active')) drawChart(latestEquity); });
+refresh(); setInterval(refresh, 3000); window.addEventListener('resize', () => { drawMetricCharts(); if (document.querySelector('#chart-view').classList.contains('active')) drawSelectedChart(); });

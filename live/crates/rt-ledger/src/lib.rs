@@ -737,7 +737,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock is after epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("ranktrend-ledger-{suffix}.sqlite3"));
+        let path = std::env::temp_dir().join(format!("airok-ledger-{suffix}.sqlite3"));
         let connection = Connection::open(&path).expect("legacy ledger opens");
         connection
             .execute_batch(

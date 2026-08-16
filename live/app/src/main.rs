@@ -32,7 +32,7 @@ use std::{
 };
 use tower_http::trace::TraceLayer;
 
-const PAPER_SESSION_ID: &str = "ranktrend-paper-v1";
+const PAPER_SESSION_ID: &str = "airok-paper-v1";
 
 #[derive(Debug, Clone, Deserialize)]
 struct RuntimeConfig {
@@ -168,7 +168,7 @@ async fn main() -> Result<()> {
     let ledger = Ledger::open(&config.storage.ledger_path)?;
     let last_decision_date = ledger
         .latest_decision_id()?
-        .and_then(|id| id.strip_prefix("ranktrend-1d-").map(ToOwned::to_owned));
+        .and_then(|id| id.strip_prefix("airok-1d-").map(ToOwned::to_owned));
     let paper_config = paper_config(&config);
     let restored_state = ledger.load_engine_state(PAPER_SESSION_ID)?;
     let bootstrap_previous_day =
@@ -241,7 +241,7 @@ async fn main() -> Result<()> {
         .route("/assets/app.js", get(app_js))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
-    println!("RankTrend paper dashboard: http://{address}");
+    println!("airōk paper dashboard: http://{address}");
     println!(
         "Paper only: this binary has no private exchange credentials or order-placement code."
     );
@@ -806,7 +806,7 @@ async fn decide_for_latest(
         .last()
         .copied()
         .context("market panel is empty")?;
-    let decision_id = format!("ranktrend-1d-{date}");
+    let decision_id = format!("airok-1d-{date}");
     if state.ledger.lock().has_decision(&decision_id)? {
         set_status(
             &state,
@@ -1108,7 +1108,7 @@ async fn run_historical_replay(
     }
     Ok(ReplayRun {
         account: AccountSnapshot {
-            session_id: "ranktrend-historical-replay".to_owned(),
+            session_id: "airok-historical-replay".to_owned(),
             captured_at: utc_midnight(replay.end),
             cash: equity,
             equity,
@@ -1152,7 +1152,7 @@ async fn serve_replay_dashboard(
         .route("/assets/app.js", get(app_js))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
-    println!("RankTrend historical replay dashboard: http://{address}");
+    println!("airōk historical replay dashboard: http://{address}");
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -1308,7 +1308,7 @@ fn set_error(state: &AppState, error: impl std::fmt::Display) {
         "The paper loop is paused until a safe data or network retry succeeds.".to_owned();
     runtime.last_error = Some(error.to_string());
     eprintln!(
-        "RankTrend paper loop: {}",
+        "airōk paper loop: {}",
         runtime.last_error.as_deref().unwrap_or_default()
     );
 }

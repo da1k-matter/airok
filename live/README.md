@@ -1,4 +1,4 @@
-# RankTrend live
+# airōk live
 
 The Rust workspace owns the paper-trading runtime. It subscribes to confirmed Bybit linear 1D candles for the active model universe, repairs missing daily candles via public REST, recomputes the causal panel, ranks the frozen LightGBM ensemble, and simulates fills from one L2 order-book snapshot per target order.
 
@@ -21,7 +21,7 @@ live/
 From `live/`:
 
 ```bash
-cargo run --release -p ranktrend-paper -- --config config/paper.toml
+cargo run --release -p airok-paper -- --config config/paper.toml
 ```
 
 Open `http://127.0.0.1:8789`. Readiness is confirmed by `GET /health` and the detailed session state at `GET /api/session`.
@@ -39,13 +39,13 @@ Sharpe and average return use consecutive minute equity returns. Profit factor a
 For a brand-new paper session, the default launch automatically bootstraps exactly one paper decision from yesterday's confirmed UTC candle. It rebuilds missing causal OHLCV history when needed, sizes and records each entry from that candle's close, and applies only the current order book's executable impact from the best quote to the fill VWAP. It then waits for subsequent 1D closes through WebSocket. No paper trades are backfilled for missed days.
 
 ```bash
-cargo run --release -p ranktrend-paper -- --config config/paper.toml
+cargo run --release -p airok-paper -- --config config/paper.toml
 ```
 
 When a paper ledger already exists, the regular launch restores it and only waits for the next confirmed close. To create a fresh empty session without its initial one-day decision, launch with `--no-bootstrap` after removing the existing paper state:
 
 ```bash
-cargo run --release -p ranktrend-paper -- --config config/paper.toml --no-bootstrap
+cargo run --release -p airok-paper -- --config config/paper.toml --no-bootstrap
 ```
 
 ### Frozen ledger replay
@@ -53,7 +53,7 @@ cargo run --release -p ranktrend-paper -- --config config/paper.toml --no-bootst
 Use `--ledger-replay` with a copied SQLite ledger to inspect a past paper session in the dashboard without making any network requests or changing the copied ledger. This preserves the recorded execution reports, order-book snapshots, positions, and equity curve exactly as captured.
 
 ```bash
-cargo run --release -p ranktrend-paper -- --config /path/to/replay.toml --ledger-replay
+cargo run --release -p airok-paper -- --config /path/to/replay.toml --ledger-replay
 ```
 
 ## Historical OOS parity replay
@@ -72,7 +72,7 @@ python src/export_bundle.py --config configs/lightgbm_h7.yaml --data data/1d \
 Then run this from `live/` and open `http://127.0.0.1:8789`:
 
 ```bash
-cargo run --release -p ranktrend-paper -- --config config/paper.toml \
+cargo run --release -p airok-paper -- --config config/paper.toml \
   --replay-start 2026-05-05 --replay-end 2026-06-29 \
   --replay-bundle models/parity_block_20260505 \
   --warmup-bundle models/parity_warmup_20260310 \
@@ -85,5 +85,5 @@ The command exits before serving if its maximum daily return or turnover differe
 
 ```bash
 cargo test --workspace
-cargo build --release -p ranktrend-paper
+cargo build --release -p airok-paper
 ```

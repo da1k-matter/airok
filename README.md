@@ -1,6 +1,6 @@
-# RankTrend
+# airōk
 
-RankTrend has two intentionally separate systems:
+airōk has two intentionally separate systems:
 
 | Directory | Owner | Purpose |
 | --- | --- | --- |
@@ -12,7 +12,7 @@ There is no Python runtime in the live service. Python produces an immutable Lig
 ## Layout
 
 ```text
-ranktrend/
+airōk/
 ├── train/                   Python research and training project
 │   ├── configs/             Research model specifications
 │   ├── data/1d/             Local daily candle source data (ignored)
@@ -52,7 +52,7 @@ Point `live/config/paper.toml` at that new bundle, then start paper trading:
 
 ```bash
 cd live
-cargo run --release -p ranktrend-paper -- --config config/paper.toml
+cargo run --release -p airok-paper -- --config config/paper.toml
 ```
 
 The dashboard is available at `http://127.0.0.1:8789`. The service uses public Bybit endpoints only and does not have private credentials or order-placement code.

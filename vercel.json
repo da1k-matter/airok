@@ -2,7 +2,7 @@
   "rewrites": [
     {
       "source": "/(.*)",
-      "destination": "http://34.12.120.169/__ranktrend/$1"
+      "destination": "http://34.12.120.169/__airok/$1"
     }
   ]
 }

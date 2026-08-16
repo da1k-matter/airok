@@ -1,6 +1,6 @@
 [package]
-name = "ranktrend-paper"
-default-run = "ranktrend-paper"
+name = "airok-paper"
+default-run = "airok-paper"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

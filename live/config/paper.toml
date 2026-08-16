@@ -15,7 +15,7 @@ reject_partial_fills = true
 bind = "127.0.0.1:8789"
 
 [storage]
-ledger_path = "state/paper/ranktrend-paper.sqlite3"
+ledger_path = "state/paper/airok-paper.sqlite3"
 
 [bybit]
 orderbook_depth = 50

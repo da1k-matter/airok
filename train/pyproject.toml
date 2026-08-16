@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ranktrend-gbm"
+name = "airok-gbm"
 version = "2.0.0"
 description = "Compact cross-sectional crypto ranking pipeline with LightGBM"
 readme = "README.md"
@@ -22,8 +22,8 @@ dependencies = [
 dev = ["pytest>=8", "ruff>=0.5"]
 
 [project.scripts]
-ranktrend = "cli:main"
-ranktrend-export = "export_bundle:main"
+airok = "cli:main"
+airok-export = "export_bundle:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -561,8 +561,8 @@ pub fn build_features(
         feature_names.push(name.to_owned());
         feature_stack.push(broadcast(&values, cols));
     }
-    if feature_names != rt_strategy::ranktrend_feature_names() {
-        bail!("Rust feature order does not match the frozen RankTrend contract");
+    if feature_names != rt_strategy::airok_feature_names() {
+        bail!("Rust feature order does not match the frozen airōk contract");
     }
     let mut valid_features = vec![true; rows * cols];
     for feature in &feature_stack {

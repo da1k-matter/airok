@@ -12,6 +12,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "airok-paper"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "csv",
+ "futures-util",
+ "parking_lot",
+ "rt-bybit",
+ "rt-domain",
+ "rt-engine",
+ "rt-execution",
+ "rt-ledger",
+ "rt-model",
+ "rt-panel",
+ "rt-strategy",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "toml",
+ "tower-http",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1171,32 +1197,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
 dependencies = [
  "rand_core 0.10.1",
-]
-
-[[package]]
-name = "ranktrend-paper"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "csv",
- "futures-util",
- "parking_lot",
- "rt-bybit",
- "rt-domain",
- "rt-engine",
- "rt-execution",
- "rt-ledger",
- "rt-model",
- "rt-panel",
- "rt-strategy",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "toml",
- "tower-http",
 ]
 
 [[package]]

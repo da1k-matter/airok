@@ -1,4 +1,4 @@
-# RankTrend training
+# airōk training
 
 The Python training project owns the complete offline pipeline: data validation, causal feature construction, walk-forward LightGBM training, portfolio construction, backtesting, reporting, and immutable LightGBM-bundle export.
 
