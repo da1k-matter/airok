@@ -16,13 +16,24 @@ venv/
 /live/airok-paper
 /live/airok-score-bundle
 
+# Runtime state, SQLite ledgers, and generated local artifacts
+**/state/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+
 # Local datasets and generated research artifacts
 **/data/
 **/outputs/
 models/
 !live/models/
 !live/models/**
-live/state/
 train/outputs/**/*.html
 
 # Local archives
