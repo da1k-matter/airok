@@ -28,7 +28,7 @@ pub struct EquityBucket {
 pub struct PerformanceMetrics {
     pub max_drawdown: f64,
     pub sharpe: Option<f64>,
-    pub average_return: Option<f64>,
+    pub average_daily_return: Option<f64>,
     pub profit_factor: Option<f64>,
     pub win_rate: Option<f64>,
     pub closed_trades: usize,
@@ -255,10 +255,33 @@ impl Ledger {
         let profit_factor = (!wins.is_empty() && !losses.is_empty())
             .then(|| wins.iter().sum::<f64>() / losses.iter().sum::<f64>().abs());
         let win_rate = (closed_trades > 0).then(|| wins.len() as f64 / closed_trades as f64);
+        let average_daily_return = self
+            .connection
+            .query_row(
+                "WITH daily_marks AS (
+                    SELECT snapshots.session_id,
+                           date(snapshots.captured_at) AS day,
+                           snapshots.equity,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY snapshots.session_id, date(snapshots.captured_at)
+                               ORDER BY snapshots.captured_at DESC, snapshots.id DESC
+                           ) AS reverse_rank
+                    FROM account_snapshots AS snapshots
+                    WHERE snapshots.session_id=?1
+                 ), daily_returns AS (
+                    SELECT equity / LAG(equity) OVER (ORDER BY day) - 1.0 AS value
+                    FROM daily_marks
+                    WHERE reverse_rank=1
+                 )
+                 SELECT AVG(value) FROM daily_returns WHERE value IS NOT NULL",
+                [session_id],
+                |row| row.get::<_, Option<f64>>(0),
+            )
+            .context("calculate average daily return")?;
         Ok(PerformanceMetrics {
             max_drawdown,
             sharpe,
-            average_return: (count > 0).then_some(mean),
+            average_daily_return,
             profit_factor,
             win_rate,
             closed_trades,
@@ -608,6 +631,16 @@ mod tests {
         assert_eq!(chart.total_points, 4);
         assert_eq!(starting_equity, 1_000.0);
         assert!((performance.max_drawdown + 0.02).abs() < 1e-12);
+        let expected_daily_return = (-0.02 + 1_010.0 / 980.0 - 1.0 + 1_005.0 / 1_010.0 - 1.0) / 3.0;
+        assert!(
+            (chart
+                .metrics
+                .average_daily_return
+                .expect("daily return exists")
+                - expected_daily_return)
+                .abs()
+                < 1e-12
+        );
     }
 
     #[test]

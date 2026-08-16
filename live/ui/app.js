@@ -175,7 +175,7 @@ const chartDefinitions = {
   sharpe: { title: 'Rolling Sharpe', copy: 'Annualized rolling Sharpe estimated from minute equity returns.', tone: '#4fc494', format: value => value.toFixed(2) },
   'profit-factor': { title: 'Profit factor', copy: 'Gross closed-trade profit divided by gross closed-trade loss.', tone: '#d99647', format: value => value.toFixed(2), unavailable: true },
   'win-rate': { title: 'Win rate', copy: 'Share of closed trades finishing with positive realized P&L.', tone: '#d99647', format: value => `${(value * 100).toFixed(1)}%`, unavailable: true },
-  returns: { title: 'Average minute return', copy: 'Rolling mean of minute-to-minute equity returns.', tone: '#4fc494', format: percent },
+  returns: { title: 'Average daily return', copy: 'Mean of completed UTC-day equity returns. The chart shows one realized return per day.', tone: '#4fc494', format: percent },
   fees: { title: 'Fees paid', copy: 'Cumulative execution fees from the available paper execution reports.', tone: '#d99a4d', format: money },
 };
 
@@ -186,8 +186,9 @@ function selectedSeries(kind) {
     let cumulative = Math.max(0, sessionFees - fees.reduce((sum, row) => sum + row.fee, 0));
     return fees.map(row => ({ value: cumulative += row.fee, captured_at: row.executed_at }));
   }
+  if (kind === 'returns') return dailyReturnRows();
   const values = metricSeries(kind);
-  const offset = kind === 'returns' || kind === 'sharpe' ? 1 : 0;
+  const offset = kind === 'sharpe' ? 1 : 0;
   return values.map((value, index) => ({ value, captured_at: latestEquity[index + offset]?.captured_at }));
 }
 
@@ -232,7 +233,7 @@ function metricSeries(kind) {
   }
   const returns = equities.slice(1).map((value, index) => equities[index] ? value / equities[index] - 1 : 0);
   const rolling = (values, windowSize, mapper) => values.map((_, index) => mapper(values.slice(Math.max(0, index - windowSize + 1), index + 1)));
-  if (kind === 'returns') return rolling(returns, 30, values => values.reduce((sum, value) => sum + value, 0) / values.length);
+  if (kind === 'returns') return dailyReturnRows().map(row => row.value);
   if (kind === 'sharpe') return rolling(returns, 60, values => {
     if (values.length < 2) return 0;
     const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
@@ -245,6 +246,21 @@ function metricSeries(kind) {
     return fees.map(row => { cumulative += row.fee; return cumulative; });
   }
   return [];
+}
+
+function dailyReturnRows() {
+  const marks = new Map();
+  latestEquity.forEach(row => {
+    const equity = Number(row.equity);
+    const capturedAt = row.captured_at;
+    if (!Number.isFinite(equity) || !capturedAt) return;
+    marks.set(new Date(capturedAt).toISOString().slice(0, 10), { equity, captured_at: capturedAt });
+  });
+  const daily = [...marks.values()].sort((left, right) => new Date(left.captured_at) - new Date(right.captured_at));
+  return daily.slice(1).map((row, index) => {
+    const previous = daily[index].equity;
+    return { value: previous ? row.equity / previous - 1 : 0, captured_at: row.captured_at };
+  });
 }
 
 function drawMetricChart(canvas) {
@@ -303,7 +319,7 @@ function renderPerformance(equity, initialEquity, metrics) {
   set('#sharpe', Number.isFinite(metrics.sharpe) ? metrics.sharpe.toFixed(2) : '—', classFor(metrics.sharpe));
   set('#profit-factor', Number.isFinite(metrics.profit_factor) ? metrics.profit_factor.toFixed(2) : '—', classFor((metrics.profit_factor ?? 1) - 1));
   set('#win-rate', Number.isFinite(metrics.win_rate) ? `${(metrics.win_rate * 100).toFixed(1)}%` : '—', classFor((metrics.win_rate ?? .5) - .5));
-  set('#average-return', Number.isFinite(metrics.average_return) ? percent(metrics.average_return) : '—', classFor(metrics.average_return));
+  set('#average-daily-return', Number.isFinite(metrics.average_daily_return) ? percent(metrics.average_daily_return) : '—', classFor(metrics.average_daily_return));
   requestAnimationFrame(drawMetricCharts);
 }
 

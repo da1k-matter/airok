@@ -1452,9 +1452,9 @@ async fn replay_equity(State(state): State<ReplayAppState>) -> Json<EquityCurve>
         .windows(2)
         .filter_map(|pair| (pair[0].equity > 0.0).then_some(pair[1].equity / pair[0].equity - 1.0))
         .collect::<Vec<_>>();
-    let average_return =
+    let average_daily_return =
         (!returns.is_empty()).then(|| returns.iter().sum::<f64>() / returns.len() as f64);
-    let sharpe = average_return.and_then(|mean| {
+    let sharpe = average_daily_return.and_then(|mean| {
         (returns.len() > 1)
             .then(|| {
                 let variance = returns
@@ -1481,7 +1481,7 @@ async fn replay_equity(State(state): State<ReplayAppState>) -> Json<EquityCurve>
         metrics: PerformanceMetrics {
             max_drawdown: max_drawdown(&state.equity),
             sharpe,
-            average_return,
+            average_daily_return,
             profit_factor: None,
             win_rate: None,
             closed_trades: 0,
