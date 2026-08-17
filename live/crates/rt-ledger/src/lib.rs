@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rt_domain::{AccountSnapshot, ExecutionReport, OrderBookSnapshot, PaperState};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 pub struct Ledger {
     connection: Connection,
@@ -105,6 +105,7 @@ pub struct SessionPerformance {
 impl Ledger {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let connection = Connection::open(path).context("open SQLite ledger")?;
+        connection.busy_timeout(Duration::from_millis(500))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let ledger = Self { connection };
@@ -114,8 +115,10 @@ impl Ledger {
 
     pub fn open_reader(path: impl AsRef<Path>) -> Result<Self> {
         let connection = Connection::open(path).context("open SQLite ledger reader")?;
+        connection.busy_timeout(Duration::from_millis(500))?;
         connection.pragma_update(None, "query_only", "ON")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.pragma_update(None, "temp_store", "MEMORY")?;
         Ok(Self { connection })
     }
 
@@ -147,6 +150,29 @@ impl Ledger {
     pub fn record_equity_point(&self, snapshot: &AccountSnapshot) -> Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
         record_equity_point_in(&transaction, snapshot)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn record_equity_point_and_state(
+        &self,
+        snapshot: &AccountSnapshot,
+        state: &PaperState,
+        updated_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        record_equity_point_in(&transaction, snapshot)?;
+        transaction.execute(
+            "INSERT INTO paper_state (session_id, updated_at, state_json) VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET
+                updated_at=excluded.updated_at,
+                state_json=excluded.state_json",
+            params![
+                state.session_id,
+                timestamp(updated_at),
+                serde_json::to_string(state)?,
+            ],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -220,27 +246,16 @@ impl Ledger {
                     SELECT bucket, MIN(equity) AS low, MAX(equity) AS high
                     FROM equity_bucketed GROUP BY bucket
                  ), drawdown_bucketed AS (
-                    SELECT id, captured_at, equity,
-                        CAST((unixepoch(captured_at) / 60 - ?2) / ?3 AS INTEGER) AS bucket,
-                        MAX(equity) OVER (
-                            ORDER BY captured_at, id
-                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                        ) AS peak_equity
-                    FROM drawdown_points WHERE session_id=?1
-                 ), drawdown_marked AS (
-                    SELECT id, captured_at, bucket,
-                        CASE WHEN peak_equity > 0.0
-                             THEN equity / peak_equity - 1.0
-                             ELSE 0.0
-                        END AS drawdown
-                    FROM drawdown_bucketed
+                    SELECT captured_at, drawdown,
+                        CAST((unixepoch(captured_at) / 60 - ?2) / ?3 AS INTEGER) AS bucket
+                    FROM drawdown_curve_points WHERE session_id=?1
                  ), drawdown_ranked AS (
-                    SELECT id, captured_at, bucket, drawdown,
+                    SELECT captured_at, bucket, drawdown,
                         ROW_NUMBER() OVER (
                             PARTITION BY bucket
-                            ORDER BY drawdown ASC, captured_at ASC, id ASC
+                            ORDER BY drawdown ASC, captured_at ASC
                         ) AS drawdown_rank
-                    FROM drawdown_marked
+                    FROM drawdown_bucketed
                  )
                  SELECT latest.captured_at, latest.equity,
                         extrema.low, extrema.high,
@@ -345,7 +360,7 @@ impl Ledger {
     pub fn session_start_equity(&self, session_id: &str) -> Result<Option<f64>> {
         self.connection
             .query_row(
-                "SELECT equity FROM account_snapshots WHERE session_id=?1 ORDER BY id ASC LIMIT 1",
+                "SELECT equity FROM account_snapshots WHERE session_id=?1 ORDER BY captured_at ASC, id ASC LIMIT 1",
                 [session_id],
                 |row| row.get(0),
             )
@@ -358,7 +373,7 @@ impl Ledger {
         self.performance_metrics_for_periods(session_id, &periods)
     }
 
-    fn performance_metrics_for_periods(
+    pub fn performance_metrics_for_periods(
         &self,
         session_id: &str,
         periods: &[DailyPeriodReturn],
@@ -385,16 +400,13 @@ impl Ledger {
         let sharpe = (count > 1 && m2 > 0.0)
             .then(|| mean / (m2 / (count - 1) as f64).sqrt() * (365.0_f64 * 24.0 * 60.0).sqrt());
         let period_metrics = summarize_periods(periods);
-        let mut closed_trades = 0;
-        let mut statement = self
-            .connection
-            .prepare("SELECT report_json FROM executions ORDER BY executed_at")?;
-        for report in statement.query_map([], |row| row.get::<_, String>(0))? {
-            let report: ExecutionReport = serde_json::from_str(&report?)?;
-            if report.closed_quantity > 0.0 {
-                closed_trades += 1;
-            }
-        }
+        let closed_trades: usize = self.connection.query_row(
+            "SELECT COUNT(*)
+             FROM executions
+             WHERE COALESCE(json_extract(report_json, '$.closed_quantity'), 0.0) > 0.0",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(PerformanceMetrics {
             max_drawdown,
             sharpe,
@@ -497,6 +509,15 @@ impl Ledger {
                 ON drawdown_points(session_id, id);
             CREATE INDEX IF NOT EXISTS drawdown_points_session_captured_at
                 ON drawdown_points(session_id, captured_at, id);
+            CREATE TABLE IF NOT EXISTS drawdown_curve_points (
+                session_id TEXT NOT NULL,
+                minute TEXT NOT NULL,
+                captured_at TEXT NOT NULL,
+                drawdown REAL NOT NULL,
+                PRIMARY KEY(session_id, minute)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS drawdown_curve_points_session_time
+                ON drawdown_curve_points(session_id, captured_at);
             CREATE TABLE IF NOT EXISTS equity_return_stats (
                 session_id TEXT PRIMARY KEY,
                 return_count INTEGER NOT NULL,
@@ -534,81 +555,95 @@ impl Ledger {
         self.connection
             .execute_batch("DROP TABLE IF EXISTS daily_account_snapshots;")?;
         self.connection.execute_batch(
-            "WITH ordered AS (
-                SELECT session_id, id, captured_at, equity,
-                    MAX(equity) OVER (
-                        PARTITION BY session_id ORDER BY captured_at, id
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                    ) AS peak_equity
-                FROM account_snapshots
-            ), stats AS (
-                SELECT session_id,
-                    MAX(peak_equity) AS peak_equity,
-                    MIN(CASE WHEN peak_equity > 0.0 THEN equity / peak_equity - 1.0 ELSE 0.0 END) AS max_drawdown,
-                    MAX(captured_at) AS updated_at
-                FROM ordered
-                GROUP BY session_id
-                )
-            INSERT INTO session_performance (
-                session_id, peak_equity, max_drawdown, updated_at
-            )
-            SELECT stats.session_id, stats.peak_equity, stats.max_drawdown, stats.updated_at
-            FROM stats
-            WHERE true
-            ON CONFLICT(session_id) DO UPDATE SET
-                peak_equity = excluded.peak_equity,
-                max_drawdown = excluded.max_drawdown,
-                updated_at = excluded.updated_at;",
-        )?;
-        self.connection.execute_batch(
-            "INSERT OR IGNORE INTO equity_curve_points (
-                session_id, minute, captured_at, equity, gross_notional, net_notional
-             )
-             SELECT snapshots.session_id,
-                    strftime('%Y-%m-%dT%H:%M:00Z', snapshots.captured_at),
-                    snapshots.captured_at, snapshots.equity,
-                    snapshots.gross_notional, snapshots.net_notional
-             FROM account_snapshots AS snapshots
-             JOIN (
+            "WITH ranked AS (
                 SELECT session_id,
                        strftime('%Y-%m-%dT%H:%M:00Z', captured_at) AS minute,
-                       MAX(id) AS id
-                FROM account_snapshots GROUP BY session_id, minute
-             ) AS latest ON latest.id=snapshots.id;",
+                       captured_at, equity, gross_notional, net_notional,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY session_id, strftime('%Y-%m-%dT%H:%M:00Z', captured_at)
+                           ORDER BY captured_at DESC, id DESC
+                       ) AS latest_rank
+                FROM account_snapshots
+             )
+             INSERT OR IGNORE INTO equity_curve_points (
+                session_id, minute, captured_at, equity, gross_notional, net_notional
+             )
+             SELECT session_id, minute, captured_at, equity, gross_notional, net_notional
+             FROM ranked
+             WHERE latest_rank=1;",
         )?;
-        self.connection.execute_batch(
-            "INSERT OR IGNORE INTO drawdown_points (session_id, captured_at, equity)
-             SELECT session_id, captured_at, equity FROM account_snapshots;
-             INSERT OR IGNORE INTO drawdown_points (session_id, captured_at, equity)
-             SELECT session_id, captured_at, equity FROM equity_curve_points;",
+        let has_drawdown_curve: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM drawdown_curve_points)",
+            [],
+            |row| row.get(0),
         )?;
-        self.connection.execute_batch(
-            "WITH ordered AS (
-                SELECT session_id, id, captured_at, equity,
-                    MAX(equity) OVER (
-                        PARTITION BY session_id ORDER BY captured_at, id
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                    ) AS peak_equity
-                FROM drawdown_points
-            ), stats AS (
-                SELECT session_id,
-                    MAX(peak_equity) AS peak_equity,
-                    MIN(CASE WHEN peak_equity > 0.0 THEN equity / peak_equity - 1.0 ELSE 0.0 END) AS max_drawdown,
-                    MAX(captured_at) AS updated_at
-                FROM ordered
-                GROUP BY session_id
-            )
-            INSERT INTO session_performance (
-                session_id, peak_equity, max_drawdown, updated_at
-            )
-            SELECT stats.session_id, stats.peak_equity, stats.max_drawdown, stats.updated_at
-            FROM stats
-            WHERE true
-            ON CONFLICT(session_id) DO UPDATE SET
-                peak_equity = excluded.peak_equity,
-                max_drawdown = excluded.max_drawdown,
-                updated_at = excluded.updated_at;",
-        )?;
+        if !has_drawdown_curve {
+            self.connection.execute_batch(
+                "INSERT OR IGNORE INTO drawdown_points (session_id, captured_at, equity)
+                 SELECT session_id, captured_at, equity FROM account_snapshots;
+                 INSERT OR IGNORE INTO drawdown_points (session_id, captured_at, equity)
+                 SELECT session_id, captured_at, equity FROM equity_curve_points;",
+            )?;
+            self.connection.execute_batch(
+                "WITH peaked AS (
+                    SELECT session_id, id, captured_at, equity,
+                           MAX(equity) OVER (
+                               PARTITION BY session_id ORDER BY captured_at, id
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                           ) AS peak_equity
+                    FROM drawdown_points
+                 ), marked AS (
+                    SELECT session_id, id, captured_at,
+                           CASE WHEN peak_equity > 0.0
+                                THEN equity / peak_equity - 1.0
+                                ELSE 0.0
+                           END AS drawdown
+                    FROM peaked
+                 ), ranked AS (
+                    SELECT session_id,
+                           strftime('%Y-%m-%dT%H:%M:00Z', captured_at) AS minute,
+                           captured_at, drawdown,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY session_id, strftime('%Y-%m-%dT%H:%M:00Z', captured_at)
+                               ORDER BY drawdown ASC, captured_at ASC, id ASC
+                           ) AS drawdown_rank
+                    FROM marked
+                 )
+                 INSERT OR IGNORE INTO drawdown_curve_points (
+                     session_id, minute, captured_at, drawdown
+                 )
+                 SELECT session_id, minute, captured_at, drawdown
+                 FROM ranked
+                 WHERE drawdown_rank=1;",
+            )?;
+            self.connection.execute_batch(
+                "WITH ordered AS (
+                    SELECT session_id, id, captured_at, equity,
+                        MAX(equity) OVER (
+                            PARTITION BY session_id ORDER BY captured_at, id
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                        ) AS peak_equity
+                    FROM drawdown_points
+                ), stats AS (
+                    SELECT session_id,
+                        MAX(peak_equity) AS peak_equity,
+                        MIN(CASE WHEN peak_equity > 0.0 THEN equity / peak_equity - 1.0 ELSE 0.0 END) AS max_drawdown,
+                        MAX(captured_at) AS updated_at
+                    FROM ordered
+                    GROUP BY session_id
+                )
+                INSERT INTO session_performance (
+                    session_id, peak_equity, max_drawdown, updated_at
+                )
+                SELECT stats.session_id, stats.peak_equity, stats.max_drawdown, stats.updated_at
+                FROM stats
+                WHERE true
+                ON CONFLICT(session_id) DO UPDATE SET
+                    peak_equity = excluded.peak_equity,
+                    max_drawdown = excluded.max_drawdown,
+                    updated_at = excluded.updated_at;",
+            )?;
+        }
         let has_return_stats: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM equity_return_stats)",
             [],
@@ -666,6 +701,28 @@ fn recompute_session_performance_in(transaction: &Transaction<'_>, session_id: &
     let (peak_equity, max_drawdown, updated_at): (Option<f64>, Option<f64>, Option<String>) =
         transaction.query_row(
             "WITH ordered AS (
+                SELECT id, captured_at, equity,
+                    MAX(equity) OVER (
+                        ORDER BY captured_at, id
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS peak_equity
+                FROM drawdown_points
+                WHERE session_id=?1
+             )
+             SELECT MAX(peak_equity),
+                    MIN(CASE WHEN peak_equity > 0.0 THEN equity / peak_equity - 1.0 ELSE 0.0 END),
+                    MAX(captured_at)
+             FROM ordered",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+
+    transaction.execute(
+        "DELETE FROM drawdown_curve_points WHERE session_id=?1",
+        [session_id],
+    )?;
+    transaction.execute(
+        "WITH peaked AS (
             SELECT id, captured_at, equity,
                 MAX(equity) OVER (
                     ORDER BY captured_at, id
@@ -673,14 +730,29 @@ fn recompute_session_performance_in(transaction: &Transaction<'_>, session_id: &
                 ) AS peak_equity
             FROM drawdown_points
             WHERE session_id=?1
-        )
-        SELECT MAX(peak_equity),
-               MIN(CASE WHEN peak_equity > 0.0 THEN equity / peak_equity - 1.0 ELSE 0.0 END),
-               MAX(captured_at)
-        FROM ordered",
-            [session_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
+         ), marked AS (
+            SELECT id, captured_at,
+                CASE WHEN peak_equity > 0.0
+                     THEN equity / peak_equity - 1.0
+                     ELSE 0.0
+                END AS drawdown
+            FROM peaked
+         ), ranked AS (
+            SELECT strftime('%Y-%m-%dT%H:%M:00Z', captured_at) AS minute,
+                   captured_at, drawdown,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY strftime('%Y-%m-%dT%H:%M:00Z', captured_at)
+                       ORDER BY drawdown ASC, captured_at ASC, id ASC
+                   ) AS drawdown_rank
+            FROM marked
+         )
+         INSERT INTO drawdown_curve_points (session_id, minute, captured_at, drawdown)
+         SELECT ?1, minute, captured_at, drawdown
+         FROM ranked
+         WHERE drawdown_rank=1",
+        [session_id],
+    )?;
+
     if let (Some(peak_equity), Some(max_drawdown), Some(updated_at)) =
         (peak_equity, max_drawdown, updated_at)
     {
@@ -692,6 +764,68 @@ fn recompute_session_performance_in(transaction: &Transaction<'_>, session_id: &
             &updated_at,
         )?;
     }
+    Ok(())
+}
+
+fn upsert_drawdown_minute_in(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    minute: &str,
+    captured_at: &str,
+    drawdown: f64,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO drawdown_curve_points (
+            session_id, minute, captured_at, drawdown
+         ) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(session_id, minute) DO UPDATE SET
+            captured_at = excluded.captured_at,
+            drawdown = excluded.drawdown
+         WHERE excluded.drawdown < drawdown_curve_points.drawdown
+            OR (
+                excluded.drawdown = drawdown_curve_points.drawdown
+                AND excluded.captured_at < drawdown_curve_points.captured_at
+            )",
+        params![session_id, minute, captured_at, drawdown],
+    )?;
+    Ok(())
+}
+
+fn recompute_equity_return_stats_in(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM equity_return_stats WHERE session_id=?1",
+        [session_id],
+    )?;
+    transaction.execute(
+        "WITH ordered AS (
+            SELECT minute, equity,
+                   LAG(equity) OVER (ORDER BY minute) AS previous,
+                   ROW_NUMBER() OVER (ORDER BY minute DESC) AS reverse_rank
+            FROM equity_curve_points
+            WHERE session_id=?1
+         ), returns AS (
+            SELECT minute, equity / previous - 1.0 AS value
+            FROM ordered
+            WHERE previous > 0.0 AND reverse_rank > 1
+         ), mean AS (
+            SELECT COUNT(*) AS return_count,
+                   AVG(value) AS mean_return,
+                   MAX(minute) AS updated_through
+            FROM returns
+         )
+         INSERT INTO equity_return_stats (
+             session_id, return_count, mean_return, return_m2, updated_through
+         )
+         SELECT ?1, mean.return_count, mean.mean_return,
+                SUM((returns.value - mean.mean_return) * (returns.value - mean.mean_return)),
+                mean.updated_through
+         FROM returns CROSS JOIN mean
+         HAVING mean.return_count > 0",
+        [session_id],
+    )?;
     Ok(())
 }
 
@@ -723,7 +857,19 @@ fn record_equity_point_in(transaction: &Transaction<'_>, snapshot: &AccountSnaps
         params![snapshot.session_id, minute],
         |row| row.get(0),
     )?;
-    if !exists {
+    let latest_minute: Option<String> = transaction
+        .query_row(
+            "SELECT minute FROM equity_curve_points
+             WHERE session_id=?1 ORDER BY minute DESC LIMIT 1",
+            [snapshot.session_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let historical_minute = latest_minute
+        .as_ref()
+        .is_some_and(|latest| minute < *latest);
+    let mut return_stats_backfill = !exists && historical_minute;
+    if !exists && !historical_minute {
         let previous = transaction
             .prepare(
                 "SELECT minute, equity FROM equity_curve_points
@@ -763,7 +909,8 @@ fn record_equity_point_in(transaction: &Transaction<'_>, snapshot: &AccountSnaps
             captured_at=excluded.captured_at,
             equity=excluded.equity,
             gross_notional=excluded.gross_notional,
-            net_notional=excluded.net_notional",
+            net_notional=excluded.net_notional
+         WHERE excluded.captured_at >= equity_curve_points.captured_at",
         params![
             snapshot.session_id,
             minute,
@@ -773,11 +920,19 @@ fn record_equity_point_in(transaction: &Transaction<'_>, snapshot: &AccountSnaps
             snapshot.net_notional,
         ],
     )?;
+    let curve_point_changed = transaction.changes() > 0;
+    if exists && historical_minute && curve_point_changed {
+        return_stats_backfill = true;
+    }
+    if return_stats_backfill {
+        recompute_equity_return_stats_in(transaction, &snapshot.session_id)?;
+    }
     if drawdown_inserted {
         let chronological = previous_latest
             .as_ref()
             .map_or(true, |previous| captured_at >= *previous);
-        // Chronological appends use the persisted running peak; backfills recompute history.
+        // Normal live appends are O(1): update the persisted peak and only the current
+        // minute's worst drawdown. Rare historical backfills rebuild exact chronology.
         if chronological {
             let previous_performance: Option<(f64, f64)> = transaction
                 .query_row(
@@ -788,22 +943,36 @@ fn record_equity_point_in(transaction: &Transaction<'_>, snapshot: &AccountSnaps
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            if let Some((previous_peak, previous_max_drawdown)) = previous_performance {
-                let current_drawdown = if previous_peak > 0.0 {
-                    snapshot.equity / previous_peak - 1.0
+            let (new_peak, current_drawdown, new_max_drawdown) =
+                if let Some((previous_peak, previous_max_drawdown)) = previous_performance {
+                    let new_peak = previous_peak.max(snapshot.equity);
+                    let current_drawdown = if new_peak > 0.0 {
+                        snapshot.equity / new_peak - 1.0
+                    } else {
+                        0.0
+                    };
+                    (
+                        new_peak,
+                        current_drawdown,
+                        previous_max_drawdown.min(current_drawdown),
+                    )
                 } else {
-                    0.0
+                    (snapshot.equity, 0.0, 0.0)
                 };
-                upsert_session_performance_in(
-                    transaction,
-                    &snapshot.session_id,
-                    previous_peak.max(snapshot.equity),
-                    previous_max_drawdown.min(current_drawdown),
-                    &captured_at,
-                )?;
-            } else {
-                recompute_session_performance_in(transaction, &snapshot.session_id)?;
-            }
+            upsert_session_performance_in(
+                transaction,
+                &snapshot.session_id,
+                new_peak,
+                new_max_drawdown,
+                &captured_at,
+            )?;
+            upsert_drawdown_minute_in(
+                transaction,
+                &snapshot.session_id,
+                &minute,
+                &captured_at,
+                current_drawdown,
+            )?;
         } else {
             recompute_session_performance_in(transaction, &snapshot.session_id)?;
         }

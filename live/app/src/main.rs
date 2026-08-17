@@ -7,9 +7,9 @@ use axum::{
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use futures_util::{StreamExt, stream};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rt_bybit::{BybitPublicClient, base_symbol, bybit_linear_symbol};
-use rt_domain::{AccountSnapshot, Candle, InstrumentRules, OrderBookSnapshot};
+use rt_domain::{AccountSnapshot, Candle, ExecutionReport, InstrumentRules, OrderBookSnapshot};
 use rt_engine::{PaperConfig, PaperEngine, RiskLimits};
 use rt_execution::SnapshotExecutionConfig;
 use rt_ledger::{
@@ -36,6 +36,9 @@ use std::{
 use tower_http::trace::TraceLayer;
 
 const PAPER_SESSION_ID: &str = "airok-paper-v1";
+const DASHBOARD_CACHE_POINTS: usize = 5_000;
+const DASHBOARD_METRICS_REFRESH: Duration = Duration::from_secs(1);
+const DASHBOARD_CURVE_REFRESH: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Deserialize)]
 struct RuntimeConfig {
@@ -89,13 +92,20 @@ struct BybitConfig {
 struct AppState {
     engine: Arc<Mutex<PaperEngine>>,
     ledger: Arc<Mutex<Ledger>>,
-    metrics_ledger: Arc<Mutex<Ledger>>,
-    executions_ledger: Arc<Mutex<Ledger>>,
-    curve_ledger: Arc<Mutex<Ledger>>,
+    dashboard_metrics_reader: Arc<Mutex<Ledger>>,
+    dashboard_curve_reader: Arc<Mutex<Ledger>>,
+    dashboard_cache: Arc<RwLock<DashboardCache>>,
     session_start_equity_usd: f64,
     instrument_rules: Arc<Mutex<InstrumentRuleCache>>,
     model: ModelView,
     runtime: Arc<Mutex<RuntimeStatus>>,
+}
+
+#[derive(Clone)]
+struct DashboardCache {
+    curve: EquityCurve,
+    metrics: PerformanceMetrics,
+    executions: Vec<ExecutionReport>,
 }
 
 #[derive(Default)]
@@ -195,17 +205,22 @@ async fn main() -> Result<()> {
     let session_start_equity_usd = ledger
         .session_start_equity(PAPER_SESSION_ID)?
         .context("session has no account snapshot")?;
-    // Keep independent read connections so slow history/metrics queries never queue behind
-    // the writer connection or behind one another. SQLite WAL allows these readers to run concurrently.
-    let metrics_ledger = Ledger::open_reader(&config.storage.ledger_path)?;
-    let executions_ledger = Ledger::open_reader(&config.storage.ledger_path)?;
-    let curve_ledger = Ledger::open_reader(&config.storage.ledger_path)?;
+    // Warm a stale-while-revalidate dashboard cache before the HTTP server starts.
+    // Reloads are then memory-only even while SQLite is busy ingesting a minute-mark burst.
+    let dashboard_metrics_reader = Ledger::open_reader(&config.storage.ledger_path)?;
+    let dashboard_curve_reader = Ledger::open_reader(&config.storage.ledger_path)?;
+    let initial_curve = dashboard_curve_reader.equity_curve(PAPER_SESSION_ID, DASHBOARD_CACHE_POINTS)?;
+    let dashboard_cache = DashboardCache {
+        metrics: initial_curve.metrics.clone(),
+        curve: initial_curve,
+        executions: dashboard_metrics_reader.recent_executions(100)?,
+    };
     let state = AppState {
         engine: Arc::new(Mutex::new(engine)),
         ledger: Arc::new(Mutex::new(ledger)),
-        metrics_ledger: Arc::new(Mutex::new(metrics_ledger)),
-        executions_ledger: Arc::new(Mutex::new(executions_ledger)),
-        curve_ledger: Arc::new(Mutex::new(curve_ledger)),
+        dashboard_metrics_reader: Arc::new(Mutex::new(dashboard_metrics_reader)),
+        dashboard_curve_reader: Arc::new(Mutex::new(dashboard_curve_reader)),
+        dashboard_cache: Arc::new(RwLock::new(dashboard_cache)),
         session_start_equity_usd,
         instrument_rules: Arc::new(Mutex::new(InstrumentRuleCache::default())),
         model: ModelView {
@@ -233,6 +248,14 @@ async fn main() -> Result<()> {
         run_previous_day_bootstrap(state.clone(), config).await?;
         return Ok(());
     }
+    tokio::spawn(run_dashboard_metrics_cache_loop(
+        Arc::clone(&state.dashboard_metrics_reader),
+        Arc::clone(&state.dashboard_cache),
+    ));
+    tokio::spawn(run_dashboard_curve_cache_loop(
+        Arc::clone(&state.dashboard_curve_reader),
+        Arc::clone(&state.dashboard_cache),
+    ));
     if !bootstrap_previous_day && !ledger_replay {
         set_status(
             &state,
@@ -268,6 +291,104 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn run_dashboard_metrics_cache_loop(
+    reader: Arc<Mutex<Ledger>>,
+    cache: Arc<RwLock<DashboardCache>>,
+) {
+    let mut interval = tokio::time::interval(DASHBOARD_METRICS_REFRESH);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let reader = Arc::clone(&reader);
+        let refreshed = tokio::task::spawn_blocking(move || {
+            let reader = reader.lock();
+            let periods = reader.completed_period_returns(PAPER_SESSION_ID)?;
+            let metrics = reader.performance_metrics_for_periods(PAPER_SESSION_ID, &periods)?;
+            Ok::<_, anyhow::Error>((metrics, periods, reader.recent_executions(100)?))
+        })
+        .await;
+        match refreshed {
+            Ok(Ok((metrics, periods, executions))) => {
+                let mut cache = cache.write();
+                cache.metrics = metrics;
+                cache.curve.periods = periods;
+                cache.executions = executions;
+            }
+            Ok(Err(error)) => eprintln!("dashboard metrics cache refresh failed: {error:#}"),
+            Err(error) => eprintln!("dashboard metrics cache worker failed: {error}"),
+        }
+    }
+}
+
+async fn run_dashboard_curve_cache_loop(
+    reader: Arc<Mutex<Ledger>>,
+    cache: Arc<RwLock<DashboardCache>>,
+) {
+    let mut interval = tokio::time::interval(DASHBOARD_CURVE_REFRESH);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let reader = Arc::clone(&reader);
+        let refreshed = tokio::task::spawn_blocking(move || {
+            let reader = reader.lock();
+            reader.equity_curve(PAPER_SESSION_ID, DASHBOARD_CACHE_POINTS)
+        })
+        .await;
+        match refreshed {
+            Ok(Ok(curve)) => cache.write().curve = curve,
+            Ok(Err(error)) => eprintln!("dashboard curve cache refresh failed: {error:#}"),
+            Err(error) => eprintln!("dashboard curve cache worker failed: {error}"),
+        }
+    }
+}
+
+fn downsample_cached_curve(
+    source: &EquityCurve,
+    metrics: &PerformanceMetrics,
+    max_points: usize,
+) -> EquityCurve {
+    let max_points = max_points.max(1);
+    if source.points.len() <= max_points {
+        let mut curve = source.clone();
+        curve.metrics = metrics.clone();
+        return curve;
+    }
+    let chunk_size = (source.points.len() + max_points - 1) / max_points;
+    let points = source
+        .points
+        .chunks(chunk_size)
+        .map(|chunk| {
+            let latest = chunk.last().expect("non-empty equity cache chunk");
+            let worst = chunk
+                .iter()
+                .min_by(|left, right| left.drawdown.total_cmp(&right.drawdown))
+                .expect("non-empty equity cache chunk");
+            EquityBucket {
+                captured_at: latest.captured_at.clone(),
+                equity: latest.equity,
+                low: chunk
+                    .iter()
+                    .map(|point| point.low)
+                    .fold(f64::INFINITY, |minimum, value| minimum.min(value)),
+                high: chunk
+                    .iter()
+                    .map(|point| point.high)
+                    .fold(f64::NEG_INFINITY, |maximum, value| maximum.max(value)),
+                drawdown: worst.drawdown,
+                drawdown_at: worst.drawdown_at.clone(),
+            }
+        })
+        .collect();
+    EquityCurve {
+        points,
+        total_points: source.total_points,
+        periods: source.periods.clone(),
+        metrics: metrics.clone(),
+    }
 }
 
 struct ReplayRequest {
@@ -558,9 +679,15 @@ async fn record_open_position_mark(state: &AppState, candle: Candle) -> Result<(
         engine.mark(&candle.symbol, candle.close, now);
         (engine.snapshot(now), engine.persistent_state())
     };
-    let ledger = state.ledger.lock();
-    ledger.record_equity_point(&snapshot)?;
-    ledger.save_engine_state(&persisted, now)?;
+    // SQLite is synchronous. Keep clustered per-symbol minute writes off Tokio's
+    // async worker threads and commit the mark + engine state in one transaction.
+    let ledger = Arc::clone(&state.ledger);
+    tokio::task::spawn_blocking(move || {
+        let ledger = ledger.lock();
+        ledger.record_equity_point_and_state(&snapshot, &persisted, now)
+    })
+    .await
+    .context("join minute-mark ledger write")??;
     Ok(())
 }
 
@@ -1397,30 +1524,12 @@ async fn positions(State(state): State<AppState>) -> Json<Vec<PositionView>> {
     )
 }
 
-async fn executions(State(state): State<AppState>) -> impl IntoResponse {
-    match state.executions_ledger.lock().recent_executions(100) {
-        Ok(reports) => Json(reports).into_response(),
-        Err(error) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!("read executions: {error}"),
-        )
-            .into_response(),
-    }
+async fn executions(State(state): State<AppState>) -> Json<Vec<ExecutionReport>> {
+    Json(state.dashboard_cache.read().executions.clone())
 }
 
-async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    match state
-        .metrics_ledger
-        .lock()
-        .performance_metrics(PAPER_SESSION_ID)
-    {
-        Ok(metrics) => Json(metrics).into_response(),
-        Err(error) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!("read performance metrics: {error}"),
-        )
-            .into_response(),
-    }
+async fn metrics(State(state): State<AppState>) -> Json<PerformanceMetrics> {
+    Json(state.dashboard_cache.read().metrics.clone())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1431,20 +1540,10 @@ struct EquityQuery {
 async fn equity(
     Query(query): Query<EquityQuery>,
     State(state): State<AppState>,
-) -> impl IntoResponse {
-    let max_points = query.max_points.unwrap_or(2_000).clamp(200, 5_000);
-    match state
-        .curve_ledger
-        .lock()
-        .equity_curve(PAPER_SESSION_ID, max_points)
-    {
-        Ok(points) => Json(points).into_response(),
-        Err(error) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!("read equity curve: {error}"),
-        )
-            .into_response(),
-    }
+) -> Json<EquityCurve> {
+    let max_points = query.max_points.unwrap_or(2_000).clamp(200, DASHBOARD_CACHE_POINTS);
+    let cache = state.dashboard_cache.read();
+    Json(downsample_cached_curve(&cache.curve, &cache.metrics, max_points))
 }
 
 async fn replay_session(State(state): State<ReplayAppState>) -> Json<SessionView> {
