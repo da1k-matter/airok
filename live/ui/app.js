@@ -19,8 +19,12 @@ let sessionInitialEquity = 0;
 let sessionFees = 0;
 let totalEquityPoints = 0;
 let nextCurveRefresh = 0;
-let fastRefreshInFlight = false;
+let sessionRefreshInFlight = false;
+let positionsRefreshInFlight = false;
+let executionsRefreshInFlight = false;
+let metricsRefreshInFlight = false;
 let curveRefreshInFlight = false;
+let positionsLoaded = false;
 let selectedChart = 'equity';
 const sorting = {
   positions: { key: 'symbol', direction: 'asc' },
@@ -355,18 +359,21 @@ function sortRows(rows, table) {
   });
 }
 
-function renderPerformance(equity, initialEquity, metrics) {
+function renderAccountPerformance(equity, initialEquity) {
   const totalPnl = equity - initialEquity, totalReturn = initialEquity ? totalPnl / initialEquity : null;
   const set = (id, value, className = '') => { const element = document.querySelector(id); element.textContent = value; element.className = className; };
   set('#total-pnl', Number.isFinite(totalPnl) ? signedMoney(totalPnl) : '—', classFor(totalPnl));
   set('#total-pnl-return', Number.isFinite(totalReturn) ? `${percent(totalReturn)} since inception` : '—', classFor(totalReturn));
+}
+
+function renderMetricValues(metrics) {
+  const set = (id, value, className = '') => { const element = document.querySelector(id); element.textContent = value; element.className = className; };
   set('#max-drawdown', Number.isFinite(metrics.max_drawdown) ? percent(metrics.max_drawdown) : '—', classFor(metrics.max_drawdown));
   set('#sharpe', Number.isFinite(metrics.sharpe) ? metrics.sharpe.toFixed(2) : '—', classFor(metrics.sharpe));
   const profitFactor = metrics.profit_factor_unbounded ? '∞' : Number.isFinite(metrics.profit_factor) ? metrics.profit_factor.toFixed(2) : '—';
   set('#profit-factor', profitFactor, classFor(metrics.profit_factor_unbounded ? 1 : (metrics.profit_factor ?? 1) - 1));
   set('#win-rate', Number.isFinite(metrics.win_rate) ? `${(metrics.win_rate * 100).toFixed(1)}%` : '—', classFor((metrics.win_rate ?? .5) - .5));
   set('#average-daily-return', Number.isFinite(metrics.average_daily_return) ? percent(metrics.average_daily_return) : '—', classFor(metrics.average_daily_return));
-  requestAnimationFrame(drawMetricCharts);
 }
 
 function renderPositions(rows, executions, equity) {
@@ -411,33 +418,85 @@ async function refreshCurve() {
     nextCurveRefresh = Date.now() + 15000;
     requestAnimationFrame(drawMetricCharts);
     if (document.querySelector('#chart-view').classList.contains('active')) drawSelectedChart();
-  } catch (_) {
+  } catch (error) {
+    console.warn('equity history refresh failed', error);
     nextCurveRefresh = Date.now() + 3000;
   } finally {
     curveRefreshInFlight = false;
   }
 }
 
-async function refresh() {
-  if (fastRefreshInFlight) return;
-  fastRefreshInFlight = true;
+async function refreshSession() {
+  if (sessionRefreshInFlight) return;
+  sessionRefreshInFlight = true;
   try {
-    const [session, positions, executions, metrics] = await Promise.all([
-      fetchJson('/api/session'),
-      fetchJson('/api/positions'),
-      fetchJson('/api/executions'),
-      fetchJson('/api/metrics'),
-    ]);
+    const session = await fetchJson('/api/session');
     const account = session.account;
-    latestMetrics = metrics;
+    sessionInitialEquity = session.session_start_equity_usd;
+    sessionFees = account.fee_paid;
+    currentEquity = account.equity;
     setTerminalMode('normal');
-    document.querySelector('#equity').textContent = money(account.equity); document.querySelector('#fees').textContent = money(account.fee_paid); document.querySelector('#model-info').textContent = `Frozen ${session.model.backend.toUpperCase()} ensemble · h${session.model.horizon_days} · ${session.model.seed_count} seeds · cut-off ${session.model.cutoff_date}`;
-    sessionInitialEquity = session.session_start_equity_usd; sessionFees = account.fee_paid; currentEquity = account.equity; renderPerformance(currentEquity, sessionInitialEquity, latestMetrics); renderTrades(executions); renderPositions(positions, executions, currentEquity); if (document.querySelector('#chart-view').classList.contains('active')) drawSelectedChart();
-    void refreshCurve();
-  } catch (_) {
+    document.querySelector('#equity').textContent = money(account.equity);
+    document.querySelector('#fees').textContent = money(account.fee_paid);
+    document.querySelector('#model-info').textContent = `Frozen ${session.model.backend.toUpperCase()} ensemble · h${session.model.horizon_days} · ${session.model.seed_count} seeds · cut-off ${session.model.cutoff_date}`;
+    renderAccountPerformance(currentEquity, sessionInitialEquity);
+    if (positionsLoaded) renderPositions(latestPositions, latestTrades, currentEquity);
+  } catch (error) {
+    console.warn('session refresh failed', error);
     setTerminalMode('error');
   } finally {
-    fastRefreshInFlight = false;
+    sessionRefreshInFlight = false;
   }
+}
+
+async function refreshMetrics() {
+  if (metricsRefreshInFlight) return;
+  metricsRefreshInFlight = true;
+  try {
+    latestMetrics = await fetchJson('/api/metrics');
+    renderMetricValues(latestMetrics);
+  } catch (error) {
+    console.warn('metrics refresh failed', error);
+  } finally {
+    metricsRefreshInFlight = false;
+  }
+}
+
+async function refreshPositions() {
+  if (positionsRefreshInFlight) return;
+  positionsRefreshInFlight = true;
+  try {
+    latestPositions = await fetchJson('/api/positions');
+    positionsLoaded = true;
+    if (currentEquity > 0) renderPositions(latestPositions, latestTrades, currentEquity);
+  } catch (error) {
+    console.warn('positions refresh failed', error);
+  } finally {
+    positionsRefreshInFlight = false;
+  }
+}
+
+async function refreshExecutions() {
+  if (executionsRefreshInFlight) return;
+  executionsRefreshInFlight = true;
+  try {
+    latestTrades = await fetchJson('/api/executions');
+    renderTrades(latestTrades);
+    if (positionsLoaded && currentEquity > 0) renderPositions(latestPositions, latestTrades, currentEquity);
+  } catch (error) {
+    console.warn('executions refresh failed', error);
+  } finally {
+    executionsRefreshInFlight = false;
+  }
+}
+
+function refresh() {
+  // Start every independent data path at the same time. No slow endpoint is allowed
+  // to hold back account values, positions, metrics, executions, or chart history.
+  void refreshSession();
+  void refreshPositions();
+  void refreshExecutions();
+  void refreshMetrics();
+  void refreshCurve();
 }
 refresh(); setInterval(refresh, 3000); window.addEventListener('resize', () => { drawMetricCharts(); if (document.querySelector('#chart-view').classList.contains('active')) drawSelectedChart(); });

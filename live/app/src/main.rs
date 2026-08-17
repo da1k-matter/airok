@@ -89,7 +89,10 @@ struct BybitConfig {
 struct AppState {
     engine: Arc<Mutex<PaperEngine>>,
     ledger: Arc<Mutex<Ledger>>,
+    metrics_ledger: Arc<Mutex<Ledger>>,
+    executions_ledger: Arc<Mutex<Ledger>>,
     curve_ledger: Arc<Mutex<Ledger>>,
+    session_start_equity_usd: f64,
     instrument_rules: Arc<Mutex<InstrumentRuleCache>>,
     model: ModelView,
     runtime: Arc<Mutex<RuntimeStatus>>,
@@ -170,7 +173,6 @@ async fn main() -> Result<()> {
         fs::create_dir_all(parent).context("create ledger directory")?;
     }
     let ledger = Ledger::open(&config.storage.ledger_path)?;
-    let curve_ledger = Ledger::open_reader(&config.storage.ledger_path)?;
     let last_decision_date = ledger
         .latest_decision_id()?
         .and_then(|id| id.strip_prefix("airok-1d-").map(ToOwned::to_owned));
@@ -190,10 +192,21 @@ async fn main() -> Result<()> {
         ledger.record_snapshot(&engine.snapshot(Utc::now()))?;
         ledger.save_engine_state(&engine.persistent_state(), Utc::now())?;
     }
+    let session_start_equity_usd = ledger
+        .session_start_equity(PAPER_SESSION_ID)?
+        .context("session has no account snapshot")?;
+    // Keep independent read connections so slow history/metrics queries never queue behind
+    // the writer connection or behind one another. SQLite WAL allows these readers to run concurrently.
+    let metrics_ledger = Ledger::open_reader(&config.storage.ledger_path)?;
+    let executions_ledger = Ledger::open_reader(&config.storage.ledger_path)?;
+    let curve_ledger = Ledger::open_reader(&config.storage.ledger_path)?;
     let state = AppState {
         engine: Arc::new(Mutex::new(engine)),
         ledger: Arc::new(Mutex::new(ledger)),
+        metrics_ledger: Arc::new(Mutex::new(metrics_ledger)),
+        executions_ledger: Arc::new(Mutex::new(executions_ledger)),
         curve_ledger: Arc::new(Mutex::new(curve_ledger)),
+        session_start_equity_usd,
         instrument_rules: Arc::new(Mutex::new(InstrumentRuleCache::default())),
         model: ModelView {
             bundle_id: bundle.manifest.bundle_id,
@@ -1338,36 +1351,20 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn session(
-    State(state): State<AppState>,
-) -> Result<Json<SessionView>, (axum::http::StatusCode, String)> {
-    let engine = state.engine.lock();
+async fn session(State(state): State<AppState>) -> Json<SessionView> {
+    // Do not touch SQLite on the hot dashboard path: session start equity is immutable
+    // for the lifetime of a paper session and is cached when the process starts.
+    let account = state.engine.lock().snapshot(Utc::now());
     let runtime = state.runtime.lock().clone();
-    let ledger = state.ledger.lock();
-    let session_start_equity_usd = ledger
-        .session_start_equity(PAPER_SESSION_ID)
-        .map_err(|error| {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("read session start equity: {error:#}"),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "session has no account snapshot".to_owned(),
-            )
-        })?;
-    drop(ledger);
-    Ok(Json(SessionView {
+    Json(SessionView {
         status: runtime.status,
         detail: runtime.detail,
         model: state.model.clone(),
-        account: engine.snapshot(Utc::now()),
-        session_start_equity_usd,
+        account,
+        session_start_equity_usd: state.session_start_equity_usd,
         last_decision_date: runtime.last_decision_date,
         last_error: runtime.last_error,
-    }))
+    })
 }
 
 async fn positions(State(state): State<AppState>) -> Json<Vec<PositionView>> {
@@ -1401,7 +1398,7 @@ async fn positions(State(state): State<AppState>) -> Json<Vec<PositionView>> {
 }
 
 async fn executions(State(state): State<AppState>) -> impl IntoResponse {
-    match state.ledger.lock().recent_executions(100) {
+    match state.executions_ledger.lock().recent_executions(100) {
         Ok(reports) => Json(reports).into_response(),
         Err(error) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1412,7 +1409,11 @@ async fn executions(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    match state.ledger.lock().performance_metrics(PAPER_SESSION_ID) {
+    match state
+        .metrics_ledger
+        .lock()
+        .performance_metrics(PAPER_SESSION_ID)
+    {
         Ok(metrics) => Json(metrics).into_response(),
         Err(error) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
