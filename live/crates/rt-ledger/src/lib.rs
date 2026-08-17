@@ -112,6 +112,13 @@ impl Ledger {
         Ok(ledger)
     }
 
+    pub fn open_reader(path: impl AsRef<Path>) -> Result<Self> {
+        let connection = Connection::open(path).context("open SQLite ledger reader")?;
+        connection.pragma_update(None, "query_only", "ON")?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(Self { connection })
+    }
+
     pub fn record_snapshot(&self, snapshot: &AccountSnapshot) -> Result<()> {
         let captured_at = timestamp(snapshot.captured_at);
         let transaction = self.connection.unchecked_transaction()?;
@@ -270,7 +277,7 @@ impl Ledger {
                 .collect::<Result<Vec<_>>>()?;
         }
         let periods = self.completed_period_returns(session_id)?;
-        let metrics = self.performance_metrics(session_id, &periods)?;
+        let metrics = self.performance_metrics_for_periods(session_id, &periods)?;
         Ok(EquityCurve {
             points,
             total_points,
@@ -346,7 +353,12 @@ impl Ledger {
             .context("read session start equity")
     }
 
-    fn performance_metrics(
+    pub fn performance_metrics(&self, session_id: &str) -> Result<PerformanceMetrics> {
+        let periods = self.completed_period_returns(session_id)?;
+        self.performance_metrics_for_periods(session_id, &periods)
+    }
+
+    fn performance_metrics_for_periods(
         &self,
         session_id: &str,
         periods: &[DailyPeriodReturn],

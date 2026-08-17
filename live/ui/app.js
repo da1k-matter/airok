@@ -19,6 +19,8 @@ let sessionInitialEquity = 0;
 let sessionFees = 0;
 let totalEquityPoints = 0;
 let nextCurveRefresh = 0;
+let fastRefreshInFlight = false;
+let curveRefreshInFlight = false;
 let selectedChart = 'equity';
 const sorting = {
   positions: { key: 'symbol', direction: 'asc' },
@@ -391,19 +393,51 @@ function renderTrades(rows) {
   renderSortIndicators('trades');
 }
 
-async function refresh() {
+async function fetchJson(url) {
+  const response = await fetch(url, { cache: 'no-store' });
+  if (!response.ok) throw new Error(`${url} unavailable`);
+  return response.json();
+}
+
+async function refreshCurve() {
+  if (curveRefreshInFlight || Date.now() < nextCurveRefresh) return;
+  curveRefreshInFlight = true;
+  const curveUrl = `/api/equity?max_points=${Math.max(400, Math.min(5000, Math.ceil(window.innerWidth * 2)))}`;
   try {
-    const now = Date.now(), shouldRefreshCurve = now >= nextCurveRefresh;
-    const curveUrl = `/api/equity?max_points=${Math.max(400, Math.min(5000, Math.ceil(window.innerWidth * 2)))}`;
-    const urls = ['/api/session', '/api/positions', '/api/executions'];
-    if (shouldRefreshCurve) urls.push(curveUrl);
-    const payloads = await Promise.all(urls.map(url => fetch(url, { cache: 'no-store' }).then(response => { if (!response.ok) throw new Error(`${url} unavailable`); return response.json(); })));
-    const [session, positions, executions, curve] = payloads;
-    if (curve) { latestEquity = curve.points; latestPeriods = curve.periods; latestMetrics = curve.metrics; totalEquityPoints = curve.total_points; nextCurveRefresh = now + 15000; }
+    const curve = await fetchJson(curveUrl);
+    latestEquity = curve.points;
+    latestPeriods = curve.periods;
+    totalEquityPoints = curve.total_points;
+    nextCurveRefresh = Date.now() + 15000;
+    requestAnimationFrame(drawMetricCharts);
+    if (document.querySelector('#chart-view').classList.contains('active')) drawSelectedChart();
+  } catch (_) {
+    nextCurveRefresh = Date.now() + 3000;
+  } finally {
+    curveRefreshInFlight = false;
+  }
+}
+
+async function refresh() {
+  if (fastRefreshInFlight) return;
+  fastRefreshInFlight = true;
+  try {
+    const [session, positions, executions, metrics] = await Promise.all([
+      fetchJson('/api/session'),
+      fetchJson('/api/positions'),
+      fetchJson('/api/executions'),
+      fetchJson('/api/metrics'),
+    ]);
     const account = session.account;
+    latestMetrics = metrics;
     setTerminalMode('normal');
     document.querySelector('#equity').textContent = money(account.equity); document.querySelector('#fees').textContent = money(account.fee_paid); document.querySelector('#model-info').textContent = `Frozen ${session.model.backend.toUpperCase()} ensemble · h${session.model.horizon_days} · ${session.model.seed_count} seeds · cut-off ${session.model.cutoff_date}`;
     sessionInitialEquity = session.session_start_equity_usd; sessionFees = account.fee_paid; currentEquity = account.equity; renderPerformance(currentEquity, sessionInitialEquity, latestMetrics); renderTrades(executions); renderPositions(positions, executions, currentEquity); if (document.querySelector('#chart-view').classList.contains('active')) drawSelectedChart();
-  } catch (_) { setTerminalMode('error'); }
+    void refreshCurve();
+  } catch (_) {
+    setTerminalMode('error');
+  } finally {
+    fastRefreshInFlight = false;
+  }
 }
 refresh(); setInterval(refresh, 3000); window.addEventListener('resize', () => { drawMetricCharts(); if (document.querySelector('#chart-view').classList.contains('active')) drawSelectedChart(); });

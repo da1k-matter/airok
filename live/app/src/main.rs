@@ -89,6 +89,7 @@ struct BybitConfig {
 struct AppState {
     engine: Arc<Mutex<PaperEngine>>,
     ledger: Arc<Mutex<Ledger>>,
+    curve_ledger: Arc<Mutex<Ledger>>,
     instrument_rules: Arc<Mutex<InstrumentRuleCache>>,
     model: ModelView,
     runtime: Arc<Mutex<RuntimeStatus>>,
@@ -169,6 +170,7 @@ async fn main() -> Result<()> {
         fs::create_dir_all(parent).context("create ledger directory")?;
     }
     let ledger = Ledger::open(&config.storage.ledger_path)?;
+    let curve_ledger = Ledger::open_reader(&config.storage.ledger_path)?;
     let last_decision_date = ledger
         .latest_decision_id()?
         .and_then(|id| id.strip_prefix("airok-1d-").map(ToOwned::to_owned));
@@ -191,6 +193,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         engine: Arc::new(Mutex::new(engine)),
         ledger: Arc::new(Mutex::new(ledger)),
+        curve_ledger: Arc::new(Mutex::new(curve_ledger)),
         instrument_rules: Arc::new(Mutex::new(InstrumentRuleCache::default())),
         model: ModelView {
             bundle_id: bundle.manifest.bundle_id,
@@ -238,6 +241,7 @@ async fn main() -> Result<()> {
         .route("/api/session", get(session))
         .route("/api/positions", get(positions))
         .route("/api/executions", get(executions))
+        .route("/api/metrics", get(metrics))
         .route("/api/equity", get(equity))
         .route("/assets/styles.css", get(styles))
         .route("/assets/sort.css", get(sort_styles))
@@ -1162,6 +1166,7 @@ async fn serve_replay_dashboard(
         .route("/api/session", get(replay_session))
         .route("/api/positions", get(replay_positions))
         .route("/api/executions", get(replay_executions))
+        .route("/api/metrics", get(replay_metrics))
         .route("/api/equity", get(replay_equity))
         .route("/assets/styles.css", get(styles))
         .route("/assets/sort.css", get(sort_styles))
@@ -1406,6 +1411,17 @@ async fn executions(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    match state.ledger.lock().performance_metrics(PAPER_SESSION_ID) {
+        Ok(metrics) => Json(metrics).into_response(),
+        Err(error) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("read performance metrics: {error}"),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct EquityQuery {
     max_points: Option<usize>,
@@ -1417,7 +1433,7 @@ async fn equity(
 ) -> impl IntoResponse {
     let max_points = query.max_points.unwrap_or(2_000).clamp(200, 5_000);
     match state
-        .ledger
+        .curve_ledger
         .lock()
         .equity_curve(PAPER_SESSION_ID, max_points)
     {
@@ -1462,7 +1478,7 @@ async fn replay_executions() -> Json<Vec<rt_domain::ExecutionReport>> {
     Json(Vec::new())
 }
 
-async fn replay_equity(State(state): State<ReplayAppState>) -> Json<EquityCurve> {
+fn replay_performance_metrics(state: &ReplayAppState) -> PerformanceMetrics {
     let period_metrics = summarize_periods(&state.periods);
     let returns = state
         .periods
@@ -1481,6 +1497,24 @@ async fn replay_equity(State(state): State<ReplayAppState>) -> Json<EquityCurve>
             })
             .flatten()
     });
+    PerformanceMetrics {
+        max_drawdown: max_drawdown(&state.equity),
+        sharpe,
+        average_daily_return: period_metrics.average_daily_return,
+        profit_factor: period_metrics.profit_factor,
+        profit_factor_unbounded: period_metrics.profit_factor_unbounded,
+        win_rate: period_metrics.win_rate,
+        period_count: period_metrics.period_count,
+        closed_trades: 0,
+    }
+}
+
+async fn replay_metrics(State(state): State<ReplayAppState>) -> Json<PerformanceMetrics> {
+    Json(replay_performance_metrics(&state))
+}
+
+async fn replay_equity(State(state): State<ReplayAppState>) -> Json<EquityCurve> {
+    let metrics = replay_performance_metrics(&state);
     let mut peak = f64::NEG_INFINITY;
     let points = state
         .equity
@@ -1506,16 +1540,7 @@ async fn replay_equity(State(state): State<ReplayAppState>) -> Json<EquityCurve>
         total_points: state.equity.len(),
         points,
         periods: state.periods,
-        metrics: PerformanceMetrics {
-            max_drawdown: max_drawdown(&state.equity),
-            sharpe,
-            average_daily_return: period_metrics.average_daily_return,
-            profit_factor: period_metrics.profit_factor,
-            profit_factor_unbounded: period_metrics.profit_factor_unbounded,
-            win_rate: period_metrics.win_rate,
-            period_count: period_metrics.period_count,
-            closed_trades: 0,
-        },
+        metrics,
     })
 }
 
