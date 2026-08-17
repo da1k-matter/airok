@@ -288,7 +288,7 @@ impl Ledger {
                            FROM account_snapshots AS snapshots
                            WHERE snapshots.session_id=?1
                              AND snapshots.captured_at <= decisions.decided_at
-                           ORDER BY snapshots.id DESC
+                           ORDER BY snapshots.captured_at DESC, snapshots.id DESC
                            LIMIT 1
                        ) AS end_equity
                 FROM decisions
@@ -630,16 +630,78 @@ impl Ledger {
     }
 }
 
+fn upsert_session_performance_in(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    peak_equity: f64,
+    max_drawdown: f64,
+    updated_at: &str,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO session_performance (
+            session_id, peak_equity, max_drawdown, updated_at
+         ) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(session_id) DO UPDATE SET
+            peak_equity = excluded.peak_equity,
+            max_drawdown = excluded.max_drawdown,
+            updated_at = excluded.updated_at",
+        params![session_id, peak_equity, max_drawdown, updated_at],
+    )?;
+    Ok(())
+}
+
+fn recompute_session_performance_in(transaction: &Transaction<'_>, session_id: &str) -> Result<()> {
+    let (peak_equity, max_drawdown, updated_at): (Option<f64>, Option<f64>, Option<String>) =
+        transaction.query_row(
+            "WITH ordered AS (
+            SELECT id, captured_at, equity,
+                MAX(equity) OVER (
+                    ORDER BY captured_at, id
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS peak_equity
+            FROM drawdown_points
+            WHERE session_id=?1
+        )
+        SELECT MAX(peak_equity),
+               MIN(CASE WHEN peak_equity > 0.0 THEN equity / peak_equity - 1.0 ELSE 0.0 END),
+               MAX(captured_at)
+        FROM ordered",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    if let (Some(peak_equity), Some(max_drawdown), Some(updated_at)) =
+        (peak_equity, max_drawdown, updated_at)
+    {
+        upsert_session_performance_in(
+            transaction,
+            session_id,
+            peak_equity,
+            max_drawdown,
+            &updated_at,
+        )?;
+    }
+    Ok(())
+}
+
 fn record_equity_point_in(transaction: &Transaction<'_>, snapshot: &AccountSnapshot) -> Result<()> {
+    let captured_at = timestamp(snapshot.captured_at);
+    let previous_latest: Option<String> = transaction
+        .query_row(
+            "SELECT captured_at
+             FROM drawdown_points
+             WHERE session_id=?1
+             ORDER BY captured_at DESC, id DESC
+             LIMIT 1",
+            [snapshot.session_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
     transaction.execute(
         "INSERT OR IGNORE INTO drawdown_points (session_id, captured_at, equity)
          VALUES (?1, ?2, ?3)",
-        params![
-            snapshot.session_id,
-            timestamp(snapshot.captured_at),
-            snapshot.equity,
-        ],
+        params![snapshot.session_id, captured_at, snapshot.equity,],
     )?;
+    let drawdown_inserted = transaction.changes() > 0;
     let minute = snapshot
         .captured_at
         .format("%Y-%m-%dT%H:%M:00Z")
@@ -681,7 +743,6 @@ fn record_equity_point_in(transaction: &Transaction<'_>, snapshot: &AccountSnaps
             )?;
         }
     }
-    let captured_at = timestamp(snapshot.captured_at);
     transaction.execute(
         "INSERT INTO equity_curve_points (
             session_id, minute, captured_at, equity, gross_notional, net_notional
@@ -700,33 +761,41 @@ fn record_equity_point_in(transaction: &Transaction<'_>, snapshot: &AccountSnaps
             snapshot.net_notional,
         ],
     )?;
-    let (peak_equity, max_drawdown, updated_at): (f64, f64, String) = transaction.query_row(
-        "WITH ordered AS (
-            SELECT id, captured_at, equity,
-                MAX(equity) OVER (
-                    ORDER BY captured_at, id
-                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                ) AS peak_equity
-            FROM drawdown_points
-            WHERE session_id=?1
-        )
-        SELECT MAX(peak_equity),
-               MIN(CASE WHEN peak_equity > 0.0 THEN equity / peak_equity - 1.0 ELSE 0.0 END),
-               MAX(captured_at)
-        FROM ordered",
-        [&snapshot.session_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    transaction.execute(
-        "INSERT INTO session_performance (
-            session_id, peak_equity, max_drawdown, updated_at
-         ) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(session_id) DO UPDATE SET
-            peak_equity = excluded.peak_equity,
-            max_drawdown = excluded.max_drawdown,
-            updated_at = excluded.updated_at",
-        params![snapshot.session_id, peak_equity, max_drawdown, updated_at],
-    )?;
+    if drawdown_inserted {
+        let chronological = previous_latest
+            .as_ref()
+            .map_or(true, |previous| captured_at >= *previous);
+        // Chronological appends use the persisted running peak; backfills recompute history.
+        if chronological {
+            let previous_performance: Option<(f64, f64)> = transaction
+                .query_row(
+                    "SELECT peak_equity, max_drawdown
+                     FROM session_performance
+                     WHERE session_id=?1",
+                    [snapshot.session_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((previous_peak, previous_max_drawdown)) = previous_performance {
+                let current_drawdown = if previous_peak > 0.0 {
+                    snapshot.equity / previous_peak - 1.0
+                } else {
+                    0.0
+                };
+                upsert_session_performance_in(
+                    transaction,
+                    &snapshot.session_id,
+                    previous_peak.max(snapshot.equity),
+                    previous_max_drawdown.min(current_drawdown),
+                    &captured_at,
+                )?;
+            } else {
+                recompute_session_performance_in(transaction, &snapshot.session_id)?;
+            }
+        } else {
+            recompute_session_performance_in(transaction, &snapshot.session_id)?;
+        }
+    }
     Ok(())
 }
 
@@ -1047,6 +1116,68 @@ mod tests {
         let only_negative = summarize_periods(&with_zero[2..]);
         assert_eq!(only_negative.profit_factor, Some(0.0));
         assert!(!only_negative.profit_factor_unbounded);
+    }
+
+    #[test]
+    fn period_mark_uses_latest_captured_snapshot_not_insert_id() {
+        let ledger = Ledger::open(":memory:").expect("ledger opens");
+        let first_date = Utc::now() - Duration::days(3);
+        let second_date = first_date + Duration::days(1);
+        ledger
+            .record_snapshot(&AccountSnapshot {
+                session_id: "test".to_owned(),
+                captured_at: first_date,
+                cash: 1_000.0,
+                equity: 1_000.0,
+                realized_pnl: 0.0,
+                unrealized_pnl: 0.0,
+                gross_notional: 0.0,
+                net_notional: 0.0,
+                fee_paid: 0.0,
+            })
+            .expect("first snapshot persists");
+        ledger
+            .record_decision(&format!("airok-1d-{}", first_date.date_naive()), first_date)
+            .expect("first decision persists");
+        ledger
+            .record_snapshot(&AccountSnapshot {
+                session_id: "test".to_owned(),
+                captured_at: second_date,
+                cash: 1_020.0,
+                equity: 1_020.0,
+                realized_pnl: 20.0,
+                unrealized_pnl: 0.0,
+                gross_notional: 0.0,
+                net_notional: 0.0,
+                fee_paid: 0.0,
+            })
+            .expect("latest snapshot persists");
+        ledger
+            .record_snapshot(&AccountSnapshot {
+                session_id: "test".to_owned(),
+                captured_at: second_date - Duration::hours(1),
+                cash: 1_010.0,
+                equity: 1_010.0,
+                realized_pnl: 10.0,
+                unrealized_pnl: 0.0,
+                gross_notional: 0.0,
+                net_notional: 0.0,
+                fee_paid: 0.0,
+            })
+            .expect("out-of-order snapshot persists");
+        ledger
+            .record_decision(
+                &format!("airok-1d-{}", second_date.date_naive()),
+                second_date + Duration::hours(1),
+            )
+            .expect("second decision persists");
+
+        let periods = ledger
+            .completed_period_returns("test")
+            .expect("periods read");
+        assert_eq!(periods.len(), 1);
+        assert_eq!(periods[0].end_equity, 1_020.0);
+        assert!((periods[0].net_return - 0.02).abs() < 1e-12);
     }
 
     #[test]
