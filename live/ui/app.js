@@ -174,14 +174,14 @@ const chartDefinitions = {
   pnl: { title: 'Total P&L', copy: 'Cumulative profit and loss measured from the persisted session starting equity.', tone: '#4fc494', format: signedMoney },
   drawdown: { title: 'Max drawdown', copy: 'Distance from the running equity peak across every stored minute mark.', tone: '#e8716d', format: percent },
   sharpe: { title: 'Rolling Sharpe', copy: 'Annualized rolling Sharpe estimated from minute equity returns.', tone: '#4fc494', format: value => value.toFixed(2) },
-  'profit-factor': { title: 'Profit factor', copy: 'Gross positive daily-period return divided by gross negative daily-period return.', tone: '#d99647', format: value => value.toFixed(2), unavailable: true },
-  'win-rate': { title: 'Win rate', copy: 'Share of completed daily periods with a positive portfolio return.', tone: '#d99647', format: value => `${(value * 100).toFixed(1)}%`, unavailable: true },
+  'profit-factor': { title: 'Profit factor', copy: 'Cumulative profit factor through each completed daily period: gross positive return divided by gross negative return.', tone: '#d99647', format: value => value.toFixed(2) },
+  'win-rate': { title: 'Win rate', copy: 'Cumulative share of non-zero completed daily periods with a positive portfolio return.', tone: '#d99647', format: value => `${(value * 100).toFixed(1)}%` },
   returns: { title: 'Average daily return', copy: 'Mean of completed UTC-day portfolio returns. The chart uses the same canonical daily periods as Win Rate and Profit Factor.', tone: '#4fc494', format: percent },
   fees: { title: 'Fees paid', copy: 'Cumulative execution fees from the available paper execution reports.', tone: '#d99a4d', format: money },
 };
 
 function selectedSeries(kind) {
-  if (kind === 'profit-factor' || kind === 'win-rate') return [];
+  if (kind === 'profit-factor' || kind === 'win-rate') return periodMetricRows(kind);
   if (kind === 'fees') {
     const fees = [...latestTrades].filter(row => Number.isFinite(row.fee) && row.fee > 0).sort((a, b) => new Date(a.executed_at) - new Date(b.executed_at));
     let cumulative = Math.max(0, sessionFees - fees.reduce((sum, row) => sum + row.fee, 0));
@@ -231,7 +231,9 @@ function drawSelectedChart() {
   const periodMetric = ['returns', 'profit-factor', 'win-rate'].includes(selectedChart);
   document.querySelector('#chart-meta').textContent = rows.length
     ? `${rows.length.toLocaleString()} plotted points`
-    : periodMetric ? 'Awaiting completed periods' : 'Awaiting closed trades';
+    : selectedChart === 'profit-factor' && latestMetrics.profit_factor_unbounded
+      ? '∞ until the first losing period'
+      : periodMetric ? 'Awaiting completed periods' : 'Awaiting closed trades';
   drawSeriesChart(rows, definition);
 }
 
@@ -242,6 +244,7 @@ function metricSeries(kind) {
       .filter(Number.isFinite);
   }
   const equities = latestEquity.map(row => Number(row.equity)).filter(Number.isFinite);
+  if (kind === 'profit-factor' || kind === 'win-rate') return periodMetricRows(kind).map(row => row.value);
   if (kind === 'returns') return periodReturnRows().map(row => row.value);
   if (!equities.length) return [];
   if (kind === 'equity') return equities;
@@ -266,6 +269,37 @@ function periodReturnRows() {
   return latestPeriods
     .filter(row => Number.isFinite(Number(row.net_return)) && row.period_date)
     .map(row => ({ value: Number(row.net_return), captured_at: row.period_date }));
+}
+
+function periodMetricRows(kind) {
+  const periods = latestPeriods
+    .filter(row => Number.isFinite(Number(row.net_return)) && row.period_date)
+    .sort((left, right) => String(left.period_date).localeCompare(String(right.period_date)));
+  const rows = [];
+  let wins = 0;
+  let nonzeroPeriods = 0;
+  let grossPositive = 0;
+  let grossNegative = 0;
+
+  periods.forEach(period => {
+    const value = Number(period.net_return);
+    if (value > 0) {
+      wins += 1;
+      nonzeroPeriods += 1;
+      grossPositive += value;
+    } else if (value < 0) {
+      nonzeroPeriods += 1;
+      grossNegative += Math.abs(value);
+    }
+
+    if (kind === 'win-rate' && nonzeroPeriods > 0) {
+      rows.push({ value: wins / nonzeroPeriods, captured_at: period.period_date });
+    } else if (kind === 'profit-factor' && grossNegative > 0) {
+      rows.push({ value: grossPositive / grossNegative, captured_at: period.period_date });
+    }
+  });
+
+  return rows;
 }
 
 function drawMetricChart(canvas) {
