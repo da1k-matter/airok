@@ -32,7 +32,7 @@ The default runtime configuration reads the shared historical candle directory a
 
 The ledger keeps one latest mark-to-market equity point for every observed UTC minute without a retention limit. Maximum drawdown is updated from every incoming mark, including multiple symbol updates inside the same minute. The dashboard requests only enough extrema-preserving time buckets for the current canvas width, so long histories remain inexpensive to transfer and render while the complete minute series stays in SQLite.
 
-Sharpe uses consecutive minute equity returns. Average daily return uses the final mark of each completed UTC day. Profit factor and win rate use net P&L from closed position quantities, including allocated entry and exit fees; they are not derived from daily account P&L.
+Sharpe uses consecutive minute equity returns. Average daily return, profit factor, and win rate use one canonical series of completed daily portfolio-period returns from persisted decision snapshots. Zero-return periods are excluded from win-rate wins/losses; execution and closed-position P&L remain available for bookkeeping diagnostics but do not drive these headline metrics.
 
 ### First paper-session bootstrap
 

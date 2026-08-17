@@ -12,7 +12,10 @@ use rt_bybit::{BybitPublicClient, base_symbol, bybit_linear_symbol};
 use rt_domain::{AccountSnapshot, Candle, InstrumentRules, OrderBookSnapshot};
 use rt_engine::{PaperConfig, PaperEngine, RiskLimits};
 use rt_execution::SnapshotExecutionConfig;
-use rt_ledger::{EquityBucket, EquityCurve, EquityPoint, Ledger, PerformanceMetrics};
+use rt_ledger::{
+    DailyPeriodReturn, EquityBucket, EquityCurve, EquityPoint, Ledger, PerformanceMetrics,
+    summarize_periods,
+};
 use rt_model::{BundleMetadata, LightGbmLibrary, NativeBooster, inspect_bundle};
 use rt_panel::{
     FeaturePanel, MarketPanel, build_features, load_daily_csv_panel, merge_confirmed_daily_candles,
@@ -264,12 +267,14 @@ struct ReplayAppState {
     account: AccountSnapshot,
     last_decision_date: String,
     equity: Vec<EquityPoint>,
+    periods: Vec<DailyPeriodReturn>,
 }
 
 struct ReplayRun {
     account: AccountSnapshot,
     last_decision_date: String,
     equity: Vec<EquityPoint>,
+    periods: Vec<DailyPeriodReturn>,
 }
 
 fn parse_arguments() -> Result<(PathBuf, bool, Option<ReplayRequest>, bool, bool)> {
@@ -1041,6 +1046,7 @@ async fn run_historical_replay(
     apply_volatility_overlay(&mut prior, &prior_volatility, OverlayRules::default())?;
     let mut equity = config.paper.initial_equity_usd;
     let mut equity_points = Vec::with_capacity(end - start + 1);
+    let mut periods = Vec::with_capacity(end - start + 1);
     let output = config
         .storage
         .ledger_path
@@ -1078,8 +1084,16 @@ async fn run_historical_replay(
             .filter_map(|(weight, value)| value.is_finite().then_some(weight * f64::from(*value)))
             .sum::<f64>();
         let net_return = gross_return - one_way_cost * turnover;
+        let start_equity = equity;
         equity *= 1.0 + net_return;
         writer.serialize((panel.market.dates[row], net_return, turnover, equity))?;
+        periods.push(DailyPeriodReturn {
+            period_date: panel.market.dates[row].to_string(),
+            start_equity,
+            end_equity: equity,
+            net_return,
+            pnl: equity - start_equity,
+        });
         equity_points.push(EquityPoint {
             captured_at: utc_midnight(panel.market.dates[row]),
             equity,
@@ -1120,6 +1134,7 @@ async fn run_historical_replay(
         },
         last_decision_date: replay.end.to_string(),
         equity: equity_points,
+        periods,
     })
 }
 
@@ -1139,6 +1154,7 @@ async fn serve_replay_dashboard(
         account: replay.account,
         last_decision_date: replay.last_decision_date,
         equity: replay.equity,
+        periods: replay.periods,
     };
     let app = Router::new()
         .route("/", get(dashboard))
@@ -1447,14 +1463,13 @@ async fn replay_executions() -> Json<Vec<rt_domain::ExecutionReport>> {
 }
 
 async fn replay_equity(State(state): State<ReplayAppState>) -> Json<EquityCurve> {
+    let period_metrics = summarize_periods(&state.periods);
     let returns = state
-        .equity
-        .windows(2)
-        .filter_map(|pair| (pair[0].equity > 0.0).then_some(pair[1].equity / pair[0].equity - 1.0))
+        .periods
+        .iter()
+        .map(|period| period.net_return)
         .collect::<Vec<_>>();
-    let average_daily_return =
-        (!returns.is_empty()).then(|| returns.iter().sum::<f64>() / returns.len() as f64);
-    let sharpe = average_daily_return.and_then(|mean| {
+    let sharpe = period_metrics.average_daily_return.and_then(|mean| {
         (returns.len() > 1)
             .then(|| {
                 let variance = returns
@@ -1466,24 +1481,39 @@ async fn replay_equity(State(state): State<ReplayAppState>) -> Json<EquityCurve>
             })
             .flatten()
     });
-    Json(EquityCurve {
-        total_points: state.equity.len(),
-        points: state
-            .equity
-            .iter()
-            .map(|point| EquityBucket {
+    let mut peak = f64::NEG_INFINITY;
+    let points = state
+        .equity
+        .iter()
+        .map(|point| {
+            peak = peak.max(point.equity);
+            let drawdown = if peak > 0.0 {
+                point.equity / peak - 1.0
+            } else {
+                0.0
+            };
+            EquityBucket {
                 captured_at: point.captured_at,
                 equity: point.equity,
                 low: point.equity,
                 high: point.equity,
-            })
-            .collect(),
+                drawdown,
+                drawdown_at: point.captured_at,
+            }
+        })
+        .collect::<Vec<_>>();
+    Json(EquityCurve {
+        total_points: state.equity.len(),
+        points,
+        periods: state.periods,
         metrics: PerformanceMetrics {
             max_drawdown: max_drawdown(&state.equity),
             sharpe,
-            average_daily_return,
-            profit_factor: None,
-            win_rate: None,
+            average_daily_return: period_metrics.average_daily_return,
+            profit_factor: period_metrics.profit_factor,
+            profit_factor_unbounded: period_metrics.profit_factor_unbounded,
+            win_rate: period_metrics.win_rate,
+            period_count: period_metrics.period_count,
             closed_trades: 0,
         },
     })

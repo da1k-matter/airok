@@ -34,6 +34,7 @@ venv/
 models/
 !live/models/
 !live/models/**
+live/models/.DS_Store
 train/outputs/**/*.html
 
 # Local archives

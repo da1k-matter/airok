@@ -14,6 +14,7 @@ let latestPositions = [];
 let latestTrades = [];
 let currentEquity = 0;
 let latestMetrics = {};
+let latestPeriods = [];
 let sessionInitialEquity = 0;
 let sessionFees = 0;
 let totalEquityPoints = 0;
@@ -173,9 +174,9 @@ const chartDefinitions = {
   pnl: { title: 'Total P&L', copy: 'Cumulative profit and loss measured from the persisted session starting equity.', tone: '#4fc494', format: signedMoney },
   drawdown: { title: 'Max drawdown', copy: 'Distance from the running equity peak across every stored minute mark.', tone: '#e8716d', format: percent },
   sharpe: { title: 'Rolling Sharpe', copy: 'Annualized rolling Sharpe estimated from minute equity returns.', tone: '#4fc494', format: value => value.toFixed(2) },
-  'profit-factor': { title: 'Profit factor', copy: 'Gross closed-trade profit divided by gross closed-trade loss.', tone: '#d99647', format: value => value.toFixed(2), unavailable: true },
-  'win-rate': { title: 'Win rate', copy: 'Share of closed trades finishing with positive realized P&L.', tone: '#d99647', format: value => `${(value * 100).toFixed(1)}%`, unavailable: true },
-  returns: { title: 'Average daily return', copy: 'Mean of completed UTC-day equity returns. The chart shows one realized return per day.', tone: '#4fc494', format: percent },
+  'profit-factor': { title: 'Profit factor', copy: 'Gross positive daily-period return divided by gross negative daily-period return.', tone: '#d99647', format: value => value.toFixed(2), unavailable: true },
+  'win-rate': { title: 'Win rate', copy: 'Share of completed daily periods with a positive portfolio return.', tone: '#d99647', format: value => `${(value * 100).toFixed(1)}%`, unavailable: true },
+  returns: { title: 'Average daily return', copy: 'Mean of completed UTC-day portfolio returns. The chart uses the same canonical daily periods as Win Rate and Profit Factor.', tone: '#4fc494', format: percent },
   fees: { title: 'Fees paid', copy: 'Cumulative execution fees from the available paper execution reports.', tone: '#d99a4d', format: money },
 };
 
@@ -186,7 +187,12 @@ function selectedSeries(kind) {
     let cumulative = Math.max(0, sessionFees - fees.reduce((sum, row) => sum + row.fee, 0));
     return fees.map(row => ({ value: cumulative += row.fee, captured_at: row.executed_at }));
   }
-  if (kind === 'returns') return dailyReturnRows();
+  if (kind === 'returns') return periodReturnRows();
+  if (kind === 'drawdown') {
+    return latestEquity
+      .filter(row => Number.isFinite(Number(row.drawdown)))
+      .map(row => ({ value: Number(row.drawdown), captured_at: row.drawdown_at }));
+  }
   const values = metricSeries(kind);
   const offset = kind === 'sharpe' ? 1 : 0;
   return values.map((value, index) => ({ value, captured_at: latestEquity[index + offset]?.captured_at }));
@@ -196,12 +202,16 @@ function drawSeriesChart(rows, definition) {
   const canvas = document.querySelector('#chart'), tip = document.querySelector('#chart-tooltip');
   const { context, W, H, L, R, T, B, plotW, plotH } = chartFrame(canvas);
   if (rows.length < 2) { tip.style.opacity = '0'; return; }
-  const values = rows.map(row => row.value), low = Math.min(...values), high = Math.max(...values), span = high - low || Math.max(Math.abs(high), 1), pad = span * .12, min = low - pad, max = high + pad, range = max - min;
+  const values = rows.map(row => row.value), isDrawdown = definition === chartDefinitions.drawdown;
+  const low = Math.min(...values), high = Math.max(...values), span = high - low || Math.max(Math.abs(high), 1);
+  const pad = span * .12, min = isDrawdown ? Math.min(low - pad, -pad) : low - pad, max = isDrawdown ? Math.max(high + pad, pad) : high + pad, range = max - min;
   const x = index => L + index / Math.max(rows.length - 1, 1) * plotW, y = value => T + (max - value) / range * plotH;
   context.strokeStyle = '#29211d'; context.fillStyle = '#7e7068'; context.font = '11px ui-monospace, monospace'; context.lineWidth = 1;
   for (let index = 0; index < 5; index += 1) { const value = min + range * index / 4, yy = y(value); context.beginPath(); context.moveTo(L, yy); context.lineTo(W - R, yy); context.stroke(); context.textAlign = 'right'; context.fillText(definition.format(value), L - 12, yy + 4); }
+  if (isDrawdown) { const baseline = y(0); context.setLineDash([3, 5]); context.strokeStyle = 'rgba(244,235,221,.28)'; context.beginPath(); context.moveTo(L, baseline); context.lineTo(W - R, baseline); context.stroke(); context.setLineDash([]); }
   const gradient = context.createLinearGradient(0, T, 0, T + plotH); gradient.addColorStop(0, `${definition.tone}42`); gradient.addColorStop(1, `${definition.tone}00`);
-  context.beginPath(); context.moveTo(x(0), T + plotH); rows.forEach((row, index) => context.lineTo(x(index), y(row.value))); context.lineTo(x(rows.length - 1), T + plotH); context.closePath(); context.fillStyle = gradient; context.fill();
+  const fillBaseline = isDrawdown ? y(0) : T + plotH;
+  context.beginPath(); context.moveTo(x(0), fillBaseline); rows.forEach((row, index) => context.lineTo(x(index), y(row.value))); context.lineTo(x(rows.length - 1), fillBaseline); context.closePath(); context.fillStyle = gradient; context.fill();
   context.beginPath(); rows.forEach((row, index) => index ? context.lineTo(x(index), y(row.value)) : context.moveTo(x(index), y(row.value))); context.strokeStyle = definition.tone; context.lineWidth = 2.25; context.stroke();
   context.fillStyle = '#7e7068'; context.textAlign = 'left'; context.fillText(timestamp(rows[0].captured_at), L, H - 15); context.textAlign = 'center'; context.fillText(`${rows.length.toLocaleString()} plotted points`, W / 2, H - 15); context.textAlign = 'right'; context.fillText(timestamp(rows.at(-1).captured_at), W - R, H - 15);
   canvas.onmousemove = event => { const rect = canvas.getBoundingClientRect(), index = Math.max(0, Math.min(rows.length - 1, Math.round(((event.clientX - rect.left - L) / plotW) * (rows.length - 1)))), row = rows[index], cx = x(index), cy = y(row.value); tip.innerHTML = `${timestamp(row.captured_at)}<br><strong style="color:${definition.tone}">${definition.format(row.value)}</strong>`; tip.style.left = `${Math.max(72, Math.min(W - 72, cx)) / W * 100}%`; tip.style.top = `${Math.max(42, cy) / H * 100}%`; tip.style.opacity = '1'; };
@@ -218,22 +228,26 @@ function drawSelectedChart() {
     return;
   }
   const rows = selectedSeries(selectedChart);
-  document.querySelector('#chart-meta').textContent = rows.length ? `${rows.length.toLocaleString()} plotted points` : 'Awaiting closed trades';
+  const periodMetric = ['returns', 'profit-factor', 'win-rate'].includes(selectedChart);
+  document.querySelector('#chart-meta').textContent = rows.length
+    ? `${rows.length.toLocaleString()} plotted points`
+    : periodMetric ? 'Awaiting completed periods' : 'Awaiting closed trades';
   drawSeriesChart(rows, definition);
 }
 
 function metricSeries(kind) {
+  if (kind === 'drawdown') {
+    return latestEquity
+      .map(row => Number(row.drawdown))
+      .filter(Number.isFinite);
+  }
   const equities = latestEquity.map(row => Number(row.equity)).filter(Number.isFinite);
+  if (kind === 'returns') return periodReturnRows().map(row => row.value);
   if (!equities.length) return [];
   if (kind === 'equity') return equities;
   if (kind === 'pnl') return equities.map(value => value - sessionInitialEquity);
-  if (kind === 'drawdown') {
-    let peak = equities[0];
-    return equities.map(value => { peak = Math.max(peak, value); return peak ? (value - peak) / peak : 0; });
-  }
   const returns = equities.slice(1).map((value, index) => equities[index] ? value / equities[index] - 1 : 0);
   const rolling = (values, windowSize, mapper) => values.map((_, index) => mapper(values.slice(Math.max(0, index - windowSize + 1), index + 1)));
-  if (kind === 'returns') return dailyReturnRows().map(row => row.value);
   if (kind === 'sharpe') return rolling(returns, 60, values => {
     if (values.length < 2) return 0;
     const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
@@ -248,19 +262,10 @@ function metricSeries(kind) {
   return [];
 }
 
-function dailyReturnRows() {
-  const marks = new Map();
-  latestEquity.forEach(row => {
-    const equity = Number(row.equity);
-    const capturedAt = row.captured_at;
-    if (!Number.isFinite(equity) || !capturedAt) return;
-    marks.set(new Date(capturedAt).toISOString().slice(0, 10), { equity, captured_at: capturedAt });
-  });
-  const daily = [...marks.values()].sort((left, right) => new Date(left.captured_at) - new Date(right.captured_at));
-  return daily.slice(1).map((row, index) => {
-    const previous = daily[index].equity;
-    return { value: previous ? row.equity / previous - 1 : 0, captured_at: row.captured_at };
-  });
+function periodReturnRows() {
+  return latestPeriods
+    .filter(row => Number.isFinite(Number(row.net_return)) && row.period_date)
+    .map(row => ({ value: Number(row.net_return), captured_at: row.period_date }));
 }
 
 function drawMetricChart(canvas) {
@@ -277,11 +282,15 @@ function drawMetricChart(canvas) {
     context.beginPath(); context.moveTo(0, height * .66); context.lineTo(width, height * .66); context.stroke();
     return;
   }
-  const min = Math.min(...values), max = Math.max(...values), range = max - min || Math.max(Math.abs(max), 1), padX = 1, padY = 8;
+  const isDrawdown = canvas.dataset.series === 'drawdown';
+  const low = Math.min(...values), high = Math.max(...values), span = high - low || Math.max(Math.abs(high), 1);
+  const pad = span * .12, min = isDrawdown ? Math.min(low - pad, -pad) : low - pad, max = isDrawdown ? Math.max(high + pad, pad) : high + pad, range = max - min, padX = 1, padY = 8;
   const x = index => padX + index / (values.length - 1) * (width - padX * 2);
   const y = value => padY + (max - value) / range * (height - padY * 2);
   const gradient = context.createLinearGradient(0, 0, 0, height); gradient.addColorStop(0, `${color}38`); gradient.addColorStop(1, `${color}00`);
-  context.beginPath(); context.moveTo(x(0), height); values.forEach((value, index) => context.lineTo(x(index), y(value))); context.lineTo(x(values.length - 1), height); context.closePath(); context.fillStyle = gradient; context.fill();
+  const fillBaseline = isDrawdown ? y(0) : height;
+  context.beginPath(); context.moveTo(x(0), fillBaseline); values.forEach((value, index) => context.lineTo(x(index), y(value))); context.lineTo(x(values.length - 1), fillBaseline); context.closePath(); context.fillStyle = gradient; context.fill();
+  if (isDrawdown) { const baseline = y(0); context.setLineDash([3, 5]); context.strokeStyle = 'rgba(244,235,221,.22)'; context.lineWidth = 1; context.beginPath(); context.moveTo(0, baseline); context.lineTo(width, baseline); context.stroke(); context.setLineDash([]); }
   context.beginPath(); values.forEach((value, index) => index ? context.lineTo(x(index), y(value)) : context.moveTo(x(index), y(value)));
   context.strokeStyle = color; context.lineWidth = 1.45; context.globalAlpha = .82; context.stroke(); context.globalAlpha = 1;
   const lastX = x(values.length - 1), lastY = y(values.at(-1));
@@ -317,7 +326,8 @@ function renderPerformance(equity, initialEquity, metrics) {
   set('#total-pnl-return', Number.isFinite(totalReturn) ? `${percent(totalReturn)} since inception` : '—', classFor(totalReturn));
   set('#max-drawdown', Number.isFinite(metrics.max_drawdown) ? percent(metrics.max_drawdown) : '—', classFor(metrics.max_drawdown));
   set('#sharpe', Number.isFinite(metrics.sharpe) ? metrics.sharpe.toFixed(2) : '—', classFor(metrics.sharpe));
-  set('#profit-factor', Number.isFinite(metrics.profit_factor) ? metrics.profit_factor.toFixed(2) : '—', classFor((metrics.profit_factor ?? 1) - 1));
+  const profitFactor = metrics.profit_factor_unbounded ? '∞' : Number.isFinite(metrics.profit_factor) ? metrics.profit_factor.toFixed(2) : '—';
+  set('#profit-factor', profitFactor, classFor(metrics.profit_factor_unbounded ? 1 : (metrics.profit_factor ?? 1) - 1));
   set('#win-rate', Number.isFinite(metrics.win_rate) ? `${(metrics.win_rate * 100).toFixed(1)}%` : '—', classFor((metrics.win_rate ?? .5) - .5));
   set('#average-daily-return', Number.isFinite(metrics.average_daily_return) ? percent(metrics.average_daily_return) : '—', classFor(metrics.average_daily_return));
   requestAnimationFrame(drawMetricCharts);
@@ -355,7 +365,7 @@ async function refresh() {
     if (shouldRefreshCurve) urls.push(curveUrl);
     const payloads = await Promise.all(urls.map(url => fetch(url, { cache: 'no-store' }).then(response => { if (!response.ok) throw new Error(`${url} unavailable`); return response.json(); })));
     const [session, positions, executions, curve] = payloads;
-    if (curve) { latestEquity = curve.points; latestMetrics = curve.metrics; totalEquityPoints = curve.total_points; nextCurveRefresh = now + 15000; }
+    if (curve) { latestEquity = curve.points; latestPeriods = curve.periods; latestMetrics = curve.metrics; totalEquityPoints = curve.total_points; nextCurveRefresh = now + 15000; }
     const account = session.account;
     setTerminalMode('normal');
     document.querySelector('#equity').textContent = money(account.equity); document.querySelector('#fees').textContent = money(account.fee_paid); document.querySelector('#model-info').textContent = `Frozen ${session.model.backend.toUpperCase()} ensemble · h${session.model.horizon_days} · ${session.model.seed_count} seeds · cut-off ${session.model.cutoff_date}`;
