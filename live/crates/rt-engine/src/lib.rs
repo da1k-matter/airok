@@ -74,6 +74,14 @@ impl PaperEngine {
         self.positions.values().cloned().collect()
     }
 
+    pub fn position_symbols(&self) -> Vec<String> {
+        self.positions.keys().cloned().collect()
+    }
+
+    pub fn has_position(&self, symbol: &str) -> bool {
+        self.positions.contains_key(symbol)
+    }
+
     pub fn persistent_state(&self) -> PaperState {
         PaperState {
             session_id: self.session_id.clone(),

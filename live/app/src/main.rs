@@ -14,7 +14,7 @@ use rt_engine::{PaperConfig, PaperEngine, RiskLimits};
 use rt_execution::SnapshotExecutionConfig;
 use rt_ledger::{
     DailyPeriodReturn, EquityBucket, EquityCurve, EquityPoint, Ledger, PerformanceMetrics,
-    summarize_periods,
+    downsample_equity_history, summarize_periods,
 };
 use rt_model::{BundleMetadata, LightGbmLibrary, NativeBooster, inspect_bundle};
 use rt_panel::{
@@ -37,8 +37,6 @@ use tower_http::trace::TraceLayer;
 
 const PAPER_SESSION_ID: &str = "airok-paper-v1";
 const DASHBOARD_CACHE_POINTS: usize = 5_000;
-const DASHBOARD_METRICS_REFRESH: Duration = Duration::from_secs(1);
-const DASHBOARD_CURVE_REFRESH: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Deserialize)]
 struct RuntimeConfig {
@@ -92,8 +90,6 @@ struct BybitConfig {
 struct AppState {
     engine: Arc<Mutex<PaperEngine>>,
     ledger: Arc<Mutex<Ledger>>,
-    dashboard_metrics_reader: Arc<Mutex<Ledger>>,
-    dashboard_curve_reader: Arc<Mutex<Ledger>>,
     dashboard_cache: Arc<RwLock<DashboardCache>>,
     session_start_equity_usd: f64,
     instrument_rules: Arc<Mutex<InstrumentRuleCache>>,
@@ -103,9 +99,341 @@ struct AppState {
 
 #[derive(Clone)]
 struct DashboardCache {
+    history: Vec<EquityBucket>,
     curve: EquityCurve,
     metrics: PerformanceMetrics,
     executions: Vec<ExecutionReport>,
+    peak_equity: f64,
+    curve_bucket_minutes: i64,
+    minute_returns: MinuteReturnState,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ReturnAccumulator {
+    count: usize,
+    mean: f64,
+    m2: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MinuteReturnState {
+    completed: ReturnAccumulator,
+    latest: Option<f64>,
+}
+
+impl ReturnAccumulator {
+    fn push(&mut self, value: f64) {
+        self.count += 1;
+        let delta = value - self.mean;
+        self.mean += delta / self.count as f64;
+        self.m2 += delta * (value - self.mean);
+    }
+
+    fn sharpe_with_latest(self, latest: Option<f64>) -> Option<f64> {
+        let mut combined = self;
+        if let Some(value) = latest {
+            combined.push(value);
+        }
+        (combined.count > 1 && combined.m2 > 0.0).then(|| {
+            combined.mean / (combined.m2 / (combined.count - 1) as f64).sqrt()
+                * (365.0_f64 * 24.0 * 60.0).sqrt()
+        })
+    }
+}
+
+impl MinuteReturnState {
+    fn from_history(history: &[EquityBucket]) -> Self {
+        let mut state = Self::default();
+        if history.len() < 2 {
+            return state;
+        }
+        for window in history.windows(2).take(history.len().saturating_sub(2)) {
+            if window[0].equity > 0.0 {
+                state.completed.push(window[1].equity / window[0].equity - 1.0);
+            }
+        }
+        let previous = &history[history.len() - 2];
+        let latest = &history[history.len() - 1];
+        if previous.equity > 0.0 {
+            state.latest = Some(latest.equity / previous.equity - 1.0);
+        }
+        state
+    }
+
+    fn advance_minute(&mut self, previous_equity: f64, new_equity: f64) {
+        if let Some(value) = self.latest.take() {
+            self.completed.push(value);
+        }
+        self.latest = (previous_equity > 0.0).then_some(new_equity / previous_equity - 1.0);
+    }
+
+    fn replace_latest(&mut self, previous_equity: Option<f64>, new_equity: f64) {
+        self.latest = previous_equity
+            .filter(|value| *value > 0.0)
+            .map(|value| new_equity / value - 1.0);
+    }
+
+    fn sharpe(&self) -> Option<f64> {
+        self.completed.sharpe_with_latest(self.latest)
+    }
+}
+
+impl DashboardCache {
+    fn load(ledger: &Ledger) -> Result<Self> {
+        let history = ledger.equity_history(PAPER_SESSION_ID)?;
+        let periods = ledger.completed_period_returns(PAPER_SESSION_ID)?;
+        let period_metrics = summarize_periods(&periods);
+        let minute_returns = MinuteReturnState::from_history(&history);
+        let performance = ledger.session_performance(PAPER_SESSION_ID)?;
+        let peak_equity = performance.as_ref().map_or_else(
+            || {
+                history
+                    .iter()
+                    .map(|point| point.equity)
+                    .fold(0.0_f64, f64::max)
+            },
+            |value| value.peak_equity,
+        );
+        let max_drawdown = performance.as_ref().map_or_else(
+            || {
+                history
+                    .iter()
+                    .map(|point| point.drawdown)
+                    .fold(0.0_f64, f64::min)
+            },
+            |value| value.max_drawdown,
+        );
+        let metrics = PerformanceMetrics {
+            max_drawdown,
+            sharpe: minute_returns.sharpe(),
+            average_daily_return: period_metrics.average_daily_return,
+            profit_factor: period_metrics.profit_factor,
+            profit_factor_unbounded: period_metrics.profit_factor_unbounded,
+            win_rate: period_metrics.win_rate,
+            period_count: period_metrics.period_count,
+            closed_trades: ledger.closed_trade_count()?,
+        };
+        let curve_points = downsample_equity_history(&history, DASHBOARD_CACHE_POINTS);
+        let curve_bucket_minutes = equity_bucket_minutes(&history, DASHBOARD_CACHE_POINTS);
+        let curve = EquityCurve {
+            points: curve_points,
+            total_points: history.len(),
+            periods,
+            metrics: metrics.clone(),
+        };
+        Ok(Self {
+            history,
+            curve,
+            metrics,
+            executions: ledger.recent_executions(100)?,
+            peak_equity,
+            curve_bucket_minutes,
+            minute_returns,
+        })
+    }
+
+    /// Apply a chronological account snapshot to the in-memory dashboard state.
+    /// Returns false for a historical/out-of-order snapshot so the caller can reload the exact
+    /// canonical state from SQLite. Normal live marks always take the O(1) path here.
+    fn apply_snapshot(&mut self, snapshot: &AccountSnapshot) -> bool {
+        let snapshot_minute = snapshot.captured_at.timestamp().div_euclid(60);
+        let previous_minute = self
+            .history
+            .last()
+            .map(|point| point.captured_at.timestamp().div_euclid(60));
+        if let Some(last) = self.history.last() {
+            if snapshot.captured_at < last.captured_at {
+                return false;
+            }
+        }
+
+        self.peak_equity = self.peak_equity.max(snapshot.equity);
+        let drawdown = if self.peak_equity > 0.0 {
+            snapshot.equity / self.peak_equity - 1.0
+        } else {
+            0.0
+        };
+        self.metrics.max_drawdown = self.metrics.max_drawdown.min(drawdown);
+
+        match previous_minute {
+            None => {
+                self.history.push(EquityBucket {
+                    captured_at: snapshot.captured_at,
+                    equity: snapshot.equity,
+                    low: snapshot.equity,
+                    high: snapshot.equity,
+                    drawdown,
+                    drawdown_at: snapshot.captured_at,
+                });
+            }
+            Some(minute) if minute == snapshot_minute => {
+                let previous_equity = (self.history.len() >= 2)
+                    .then(|| self.history[self.history.len() - 2].equity);
+                let point = self
+                    .history
+                    .last_mut()
+                    .expect("dashboard history has a current minute");
+                point.captured_at = snapshot.captured_at;
+                point.equity = snapshot.equity;
+                // The persisted equity curve intentionally keeps the latest mark per minute;
+                // intraminute extrema are represented by the separate drawdown path.
+                point.low = snapshot.equity;
+                point.high = snapshot.equity;
+                if drawdown < point.drawdown
+                    || (drawdown == point.drawdown && snapshot.captured_at < point.drawdown_at)
+                {
+                    point.drawdown = drawdown;
+                    point.drawdown_at = snapshot.captured_at;
+                }
+                self.minute_returns
+                    .replace_latest(previous_equity, snapshot.equity);
+            }
+            Some(minute) if snapshot_minute > minute => {
+                let previous_equity = self
+                    .history
+                    .last()
+                    .expect("dashboard history has a previous minute")
+                    .equity;
+                self.minute_returns
+                    .advance_minute(previous_equity, snapshot.equity);
+                self.history.push(EquityBucket {
+                    captured_at: snapshot.captured_at,
+                    equity: snapshot.equity,
+                    low: snapshot.equity,
+                    high: snapshot.equity,
+                    drawdown,
+                    drawdown_at: snapshot.captured_at,
+                });
+            }
+            Some(_) => return false,
+        }
+
+        self.metrics.sharpe = self.minute_returns.sharpe();
+        self.refresh_curve_tail(previous_minute);
+        true
+    }
+
+    fn record_execution(&mut self, report: ExecutionReport) {
+        if report.closed_quantity > 0.0 {
+            self.metrics.closed_trades += 1;
+        }
+        self.executions
+            .retain(|existing| existing.execution_id != report.execution_id);
+        let insert_at = self
+            .executions
+            .partition_point(|existing| existing.executed_at > report.executed_at);
+        self.executions.insert(insert_at, report);
+        self.executions.truncate(100);
+    }
+
+    fn replace_periods(&mut self, periods: Vec<DailyPeriodReturn>) {
+        let summary = summarize_periods(&periods);
+        self.metrics.average_daily_return = summary.average_daily_return;
+        self.metrics.profit_factor = summary.profit_factor;
+        self.metrics.profit_factor_unbounded = summary.profit_factor_unbounded;
+        self.metrics.win_rate = summary.win_rate;
+        self.metrics.period_count = summary.period_count;
+        self.curve.periods = periods;
+    }
+
+    fn refresh_curve_tail(&mut self, previous_minute: Option<i64>) {
+        self.curve.total_points = self.history.len();
+        let bucket_minutes = equity_bucket_minutes(&self.history, DASHBOARD_CACHE_POINTS);
+        if self.curve.points.is_empty() || bucket_minutes != self.curve_bucket_minutes {
+            self.curve.points = downsample_equity_history(&self.history, DASHBOARD_CACHE_POINTS);
+            self.curve_bucket_minutes = bucket_minutes;
+            return;
+        }
+        let Some(first) = self.history.first() else {
+            self.curve.points.clear();
+            return;
+        };
+        let first_minute = first.captured_at.timestamp().div_euclid(60);
+        let latest_minute = self
+            .history
+            .last()
+            .expect("dashboard history has latest point")
+            .captured_at
+            .timestamp()
+            .div_euclid(60);
+        let latest_bucket = (latest_minute - first_minute).div_euclid(bucket_minutes.max(1));
+        let previous_bucket = previous_minute
+            .map(|minute| (minute - first_minute).div_euclid(bucket_minutes.max(1)));
+        let aggregate = aggregate_history_bucket(
+            &self.history,
+            first_minute,
+            bucket_minutes,
+            latest_bucket,
+        );
+        match previous_bucket {
+            Some(bucket) if bucket == latest_bucket => {
+                if let Some(last) = self.curve.points.last_mut() {
+                    *last = aggregate;
+                } else {
+                    self.curve.points.push(aggregate);
+                }
+            }
+            _ => self.curve.points.push(aggregate),
+        }
+    }
+}
+
+fn equity_bucket_minutes(history: &[EquityBucket], max_buckets: usize) -> i64 {
+    let max_buckets = max_buckets.max(1);
+    if history.len() <= max_buckets {
+        return 1;
+    }
+    let Some(first) = history.first() else {
+        return 1;
+    };
+    let Some(last) = history.last() else {
+        return 1;
+    };
+    let first_minute = first.captured_at.timestamp().div_euclid(60);
+    let last_minute = last.captured_at.timestamp().div_euclid(60);
+    let duration = last_minute - first_minute + 1;
+    ((duration + max_buckets as i64 - 1) / max_buckets as i64).max(1)
+}
+
+fn aggregate_history_bucket(
+    history: &[EquityBucket],
+    first_minute: i64,
+    bucket_minutes: i64,
+    target_bucket: i64,
+) -> EquityBucket {
+    let start = history
+        .iter()
+        .rposition(|point| {
+            let minute = point.captured_at.timestamp().div_euclid(60);
+            (minute - first_minute).div_euclid(bucket_minutes.max(1)) < target_bucket
+        })
+        .map_or(0, |index| index + 1);
+    let slice = &history[start..];
+    let latest = slice
+        .last()
+        .expect("latest dashboard bucket contains at least one point");
+    let worst = slice
+        .iter()
+        .min_by(|left, right| {
+            left.drawdown
+                .total_cmp(&right.drawdown)
+                .then_with(|| left.drawdown_at.cmp(&right.drawdown_at))
+        })
+        .expect("latest dashboard bucket contains at least one point");
+    EquityBucket {
+        captured_at: latest.captured_at,
+        equity: latest.equity,
+        low: slice
+            .iter()
+            .map(|point| point.low)
+            .fold(f64::INFINITY, f64::min),
+        high: slice
+            .iter()
+            .map(|point| point.high)
+            .fold(f64::NEG_INFINITY, f64::max),
+        drawdown: worst.drawdown,
+        drawdown_at: worst.drawdown_at,
+    }
 }
 
 #[derive(Default)]
@@ -205,21 +533,12 @@ async fn main() -> Result<()> {
     let session_start_equity_usd = ledger
         .session_start_equity(PAPER_SESSION_ID)?
         .context("session has no account snapshot")?;
-    // Warm a stale-while-revalidate dashboard cache before the HTTP server starts.
-    // Reloads are then memory-only even while SQLite is busy ingesting a minute-mark burst.
-    let dashboard_metrics_reader = Ledger::open_reader(&config.storage.ledger_path)?;
-    let dashboard_curve_reader = Ledger::open_reader(&config.storage.ledger_path)?;
-    let initial_curve = dashboard_curve_reader.equity_curve(PAPER_SESSION_ID, DASHBOARD_CACHE_POINTS)?;
-    let dashboard_cache = DashboardCache {
-        metrics: initial_curve.metrics.clone(),
-        curve: initial_curve,
-        executions: dashboard_metrics_reader.recent_executions(100)?,
-    };
+    // SQLite is the durable recovery/audit store. The dashboard is warmed once into RAM and then
+    // maintained directly from engine events; there are no recurring full-history SQL scans.
+    let dashboard_cache = DashboardCache::load(&ledger)?;
     let state = AppState {
         engine: Arc::new(Mutex::new(engine)),
         ledger: Arc::new(Mutex::new(ledger)),
-        dashboard_metrics_reader: Arc::new(Mutex::new(dashboard_metrics_reader)),
-        dashboard_curve_reader: Arc::new(Mutex::new(dashboard_curve_reader)),
         dashboard_cache: Arc::new(RwLock::new(dashboard_cache)),
         session_start_equity_usd,
         instrument_rules: Arc::new(Mutex::new(InstrumentRuleCache::default())),
@@ -248,14 +567,6 @@ async fn main() -> Result<()> {
         run_previous_day_bootstrap(state.clone(), config).await?;
         return Ok(());
     }
-    tokio::spawn(run_dashboard_metrics_cache_loop(
-        Arc::clone(&state.dashboard_metrics_reader),
-        Arc::clone(&state.dashboard_cache),
-    ));
-    tokio::spawn(run_dashboard_curve_cache_loop(
-        Arc::clone(&state.dashboard_curve_reader),
-        Arc::clone(&state.dashboard_cache),
-    ));
     if !bootstrap_previous_day && !ledger_replay {
         set_status(
             &state,
@@ -291,59 +602,6 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-async fn run_dashboard_metrics_cache_loop(
-    reader: Arc<Mutex<Ledger>>,
-    cache: Arc<RwLock<DashboardCache>>,
-) {
-    let mut interval = tokio::time::interval(DASHBOARD_METRICS_REFRESH);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    interval.tick().await;
-    loop {
-        interval.tick().await;
-        let reader = Arc::clone(&reader);
-        let refreshed = tokio::task::spawn_blocking(move || {
-            let reader = reader.lock();
-            let periods = reader.completed_period_returns(PAPER_SESSION_ID)?;
-            let metrics = reader.performance_metrics_for_periods(PAPER_SESSION_ID, &periods)?;
-            Ok::<_, anyhow::Error>((metrics, periods, reader.recent_executions(100)?))
-        })
-        .await;
-        match refreshed {
-            Ok(Ok((metrics, periods, executions))) => {
-                let mut cache = cache.write();
-                cache.metrics = metrics;
-                cache.curve.periods = periods;
-                cache.executions = executions;
-            }
-            Ok(Err(error)) => eprintln!("dashboard metrics cache refresh failed: {error:#}"),
-            Err(error) => eprintln!("dashboard metrics cache worker failed: {error}"),
-        }
-    }
-}
-
-async fn run_dashboard_curve_cache_loop(
-    reader: Arc<Mutex<Ledger>>,
-    cache: Arc<RwLock<DashboardCache>>,
-) {
-    let mut interval = tokio::time::interval(DASHBOARD_CURVE_REFRESH);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    interval.tick().await;
-    loop {
-        interval.tick().await;
-        let reader = Arc::clone(&reader);
-        let refreshed = tokio::task::spawn_blocking(move || {
-            let reader = reader.lock();
-            reader.equity_curve(PAPER_SESSION_ID, DASHBOARD_CACHE_POINTS)
-        })
-        .await;
-        match refreshed {
-            Ok(Ok(curve)) => cache.write().curve = curve,
-            Ok(Err(error)) => eprintln!("dashboard curve cache refresh failed: {error:#}"),
-            Err(error) => eprintln!("dashboard curve cache worker failed: {error}"),
-        }
-    }
 }
 
 fn downsample_cached_curve(
@@ -656,29 +914,20 @@ async fn run_open_position_mark_loop(state: AppState, config: RuntimeConfig) {
 }
 
 fn open_position_symbols(state: &AppState) -> Vec<String> {
-    state
-        .engine
-        .lock()
-        .positions()
-        .into_iter()
-        .map(|position| position.symbol)
-        .collect()
+    state.engine.lock().position_symbols()
 }
 
 async fn record_open_position_mark(state: &AppState, candle: Candle) -> Result<()> {
     let now = Utc::now();
     let (snapshot, persisted) = {
         let mut engine = state.engine.lock();
-        if !engine
-            .positions()
-            .iter()
-            .any(|position| position.symbol == candle.symbol)
-        {
+        if !engine.has_position(&candle.symbol) {
             return Ok(());
         }
         engine.mark(&candle.symbol, candle.close, now);
         (engine.snapshot(now), engine.persistent_state())
     };
+    let dashboard_snapshot = snapshot.clone();
     // SQLite is synchronous. Keep clustered per-symbol minute writes off Tokio's
     // async worker threads and commit the mark + engine state in one transaction.
     let ledger = Arc::clone(&state.ledger);
@@ -688,6 +937,21 @@ async fn record_open_position_mark(state: &AppState, candle: Candle) -> Result<(
     })
     .await
     .context("join minute-mark ledger write")??;
+    apply_dashboard_snapshot(state, &dashboard_snapshot)?;
+    Ok(())
+}
+
+fn apply_dashboard_snapshot(state: &AppState, snapshot: &AccountSnapshot) -> Result<()> {
+    if state.dashboard_cache.write().apply_snapshot(snapshot) {
+        return Ok(());
+    }
+    // Historical/out-of-order inserts are rare but can alter all later drawdowns. In that case
+    // SQLite remains the canonical source and we rebuild the in-memory view exactly once.
+    let refreshed = {
+        let ledger = state.ledger.lock();
+        DashboardCache::load(&ledger)?
+    };
+    *state.dashboard_cache.write() = refreshed;
     Ok(())
 }
 
@@ -813,6 +1077,8 @@ fn record_confirmed_close_mark(state: &AppState, closes: &BTreeMap<String, f64>)
     let ledger = state.ledger.lock();
     ledger.record_snapshot(&snapshot)?;
     ledger.save_engine_state(&persisted, now)?;
+    drop(ledger);
+    apply_dashboard_snapshot(state, &snapshot)?;
     Ok(())
 }
 
@@ -1051,6 +1317,7 @@ async fn decide_for_latest(
         };
         if let Some(report) = report {
             state.ledger.lock().record_execution(&report, &book)?;
+            state.dashboard_cache.write().record_execution(report);
         }
     }
     let now = Utc::now();
@@ -1062,7 +1329,10 @@ async fn decide_for_latest(
     ledger.record_snapshot(&snapshot)?;
     ledger.save_engine_state(&persisted, now)?;
     ledger.record_decision(&decision_id, now)?;
+    let periods = ledger.completed_period_returns(PAPER_SESSION_ID)?;
     drop(ledger);
+    apply_dashboard_snapshot(&state, &snapshot)?;
+    state.dashboard_cache.write().replace_periods(periods);
     let mut runtime = state.runtime.lock();
     runtime.status = "waiting_for_daily_close".to_owned();
     runtime.detail =

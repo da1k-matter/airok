@@ -99,6 +99,7 @@ pub struct EquityCurve {
 
 #[derive(Debug, Clone, Copy)]
 pub struct SessionPerformance {
+    pub peak_equity: f64,
     pub max_drawdown: f64,
 }
 
@@ -214,83 +215,51 @@ impl Ledger {
         Ok(reports)
     }
 
-    pub fn equity_curve(&self, session_id: &str, max_buckets: usize) -> Result<EquityCurve> {
-        let (count, first_second, last_second): (i64, Option<i64>, Option<i64>) =
-            self.connection.query_row(
-                "SELECT COUNT(*), MIN(unixepoch(captured_at)), MAX(unixepoch(captured_at))
-                 FROM equity_curve_points WHERE session_id=?1",
-                [session_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
-        let total_points = usize::try_from(count).unwrap_or(usize::MAX);
-        let mut points = Vec::new();
-        if count > 0 {
-            let first_minute = first_second.context("equity curve start is absent")? / 60;
-            let last_minute = last_second.context("equity curve end is absent")? / 60;
-            let duration = last_minute - first_minute + 1;
-            let bucket_minutes = if total_points <= max_buckets.max(1) {
-                1
-            } else {
-                (duration + max_buckets.max(1) as i64 - 1) / max_buckets.max(1) as i64
-            };
-            let mut statement = self.connection.prepare(
-                "WITH equity_bucketed AS (
-                    SELECT captured_at, minute, equity,
-                        CAST((unixepoch(captured_at) / 60 - ?2) / ?3 AS INTEGER) AS bucket
-                    FROM equity_curve_points WHERE session_id=?1
-                 ), equity_ranked AS (
-                    SELECT captured_at, equity, bucket,
-                        ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY minute DESC) AS reverse_rank
-                    FROM equity_bucketed
-                 ), equity_extrema AS (
-                    SELECT bucket, MIN(equity) AS low, MAX(equity) AS high
-                    FROM equity_bucketed GROUP BY bucket
-                 ), drawdown_bucketed AS (
-                    SELECT captured_at, drawdown,
-                        CAST((unixepoch(captured_at) / 60 - ?2) / ?3 AS INTEGER) AS bucket
-                    FROM drawdown_curve_points WHERE session_id=?1
-                 ), drawdown_ranked AS (
-                    SELECT captured_at, bucket, drawdown,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY bucket
-                            ORDER BY drawdown ASC, captured_at ASC
-                        ) AS drawdown_rank
-                    FROM drawdown_bucketed
-                 )
-                 SELECT latest.captured_at, latest.equity,
-                        extrema.low, extrema.high,
-                        worst.drawdown, worst.captured_at
-                 FROM equity_ranked AS latest
-                 JOIN equity_extrema AS extrema USING (bucket)
-                 JOIN drawdown_ranked AS worst USING (bucket)
-                 WHERE latest.reverse_rank=1 AND worst.drawdown_rank=1
-                 ORDER BY latest.bucket",
-            )?;
-            points = statement
-                .query_map(params![session_id, first_minute, bucket_minutes], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, f64>(1)?,
-                        row.get::<_, f64>(2)?,
-                        row.get::<_, f64>(3)?,
-                        row.get::<_, f64>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-                .into_iter()
-                .map(|(captured_at, equity, low, high, drawdown, drawdown_at)| {
-                    Ok(EquityBucket {
-                        captured_at: parse_timestamp(&captured_at)?,
-                        equity,
-                        low,
-                        high,
-                        drawdown,
-                        drawdown_at: parse_timestamp(&drawdown_at)?,
-                    })
+    /// Load the canonical one-point-per-minute equity history.
+    ///
+    /// This is intentionally a simple ordered scan. The dashboard keeps this result in RAM and
+    /// updates it from live engine events, so SQLite is a recovery/audit store rather than a
+    /// recurring analytics engine. Keeping this path linear also makes one-off/replay reads cheap
+    /// even for long-running ledgers.
+    pub fn equity_history(&self, session_id: &str) -> Result<Vec<EquityBucket>> {
+        let mut statement = self.connection.prepare(
+            "SELECT equity.captured_at, equity.equity,
+                    drawdown.drawdown, drawdown.captured_at
+             FROM equity_curve_points AS equity
+             JOIN drawdown_curve_points AS drawdown
+               ON drawdown.session_id=equity.session_id
+              AND drawdown.minute=equity.minute
+             WHERE equity.session_id=?1
+             ORDER BY equity.minute",
+        )?;
+        statement
+            .query_map([session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|(captured_at, equity, drawdown, drawdown_at)| {
+                Ok(EquityBucket {
+                    captured_at: parse_timestamp(&captured_at)?,
+                    equity,
+                    low: equity,
+                    high: equity,
+                    drawdown,
+                    drawdown_at: parse_timestamp(&drawdown_at)?,
                 })
-                .collect::<Result<Vec<_>>>()?;
-        }
+            })
+            .collect()
+    }
+
+    pub fn equity_curve(&self, session_id: &str, max_buckets: usize) -> Result<EquityCurve> {
+        let history = self.equity_history(session_id)?;
+        let total_points = history.len();
+        let points = downsample_equity_history(&history, max_buckets);
         let periods = self.completed_period_returns(session_id)?;
         let metrics = self.performance_metrics_for_periods(session_id, &periods)?;
         Ok(EquityCurve {
@@ -345,11 +314,12 @@ impl Ledger {
     pub fn session_performance(&self, session_id: &str) -> Result<Option<SessionPerformance>> {
         self.connection
             .query_row(
-                "SELECT max_drawdown FROM session_performance WHERE session_id=?1",
+                "SELECT peak_equity, max_drawdown FROM session_performance WHERE session_id=?1",
                 [session_id],
                 |row| {
                     Ok(SessionPerformance {
-                        max_drawdown: row.get(0)?,
+                        peak_equity: row.get(0)?,
+                        max_drawdown: row.get(1)?,
                     })
                 },
             )
@@ -400,13 +370,7 @@ impl Ledger {
         let sharpe = (count > 1 && m2 > 0.0)
             .then(|| mean / (m2 / (count - 1) as f64).sqrt() * (365.0_f64 * 24.0 * 60.0).sqrt());
         let period_metrics = summarize_periods(periods);
-        let closed_trades: usize = self.connection.query_row(
-            "SELECT COUNT(*)
-             FROM executions
-             WHERE COALESCE(json_extract(report_json, '$.closed_quantity'), 0.0) > 0.0",
-            [],
-            |row| row.get(0),
-        )?;
+        let closed_trades = self.closed_trade_count()?;
         Ok(PerformanceMetrics {
             max_drawdown,
             sharpe,
@@ -417,6 +381,16 @@ impl Ledger {
             closed_trades,
             period_count: period_metrics.period_count,
         })
+    }
+
+    pub fn closed_trade_count(&self) -> Result<usize> {
+        self.connection.query_row(
+            "SELECT COUNT(*)
+             FROM executions
+             WHERE COALESCE(json_extract(report_json, '$.closed_quantity'), 0.0) > 0.0",
+            [],
+            |row| row.get(0),
+        ).context("count closed executions")
     }
 
     pub fn save_engine_state(&self, state: &PaperState, updated_at: DateTime<Utc>) -> Result<()> {
@@ -978,6 +952,53 @@ fn record_equity_point_in(transaction: &Transaction<'_>, snapshot: &AccountSnaps
         }
     }
     Ok(())
+}
+
+pub fn downsample_equity_history(
+    source: &[EquityBucket],
+    max_buckets: usize,
+) -> Vec<EquityBucket> {
+    let max_buckets = max_buckets.max(1);
+    if source.len() <= max_buckets {
+        return source.to_vec();
+    }
+    let Some(first) = source.first() else {
+        return Vec::new();
+    };
+    let Some(last) = source.last() else {
+        return Vec::new();
+    };
+    let first_minute = first.captured_at.timestamp().div_euclid(60);
+    let last_minute = last.captured_at.timestamp().div_euclid(60);
+    let duration = last_minute - first_minute + 1;
+    let bucket_minutes = (duration + max_buckets as i64 - 1) / max_buckets as i64;
+
+    let mut result = Vec::with_capacity(max_buckets.min(source.len()));
+    let mut current_bucket = i64::MIN;
+    for point in source {
+        let minute = point.captured_at.timestamp().div_euclid(60);
+        let bucket = (minute - first_minute).div_euclid(bucket_minutes.max(1));
+        if bucket != current_bucket {
+            result.push(point.clone());
+            current_bucket = bucket;
+            continue;
+        }
+        let aggregate = result
+            .last_mut()
+            .expect("equity bucket exists after first source point");
+        aggregate.captured_at = point.captured_at;
+        aggregate.equity = point.equity;
+        aggregate.low = aggregate.low.min(point.low);
+        aggregate.high = aggregate.high.max(point.high);
+        if point.drawdown < aggregate.drawdown
+            || (point.drawdown == aggregate.drawdown
+                && point.drawdown_at < aggregate.drawdown_at)
+        {
+            aggregate.drawdown = point.drawdown;
+            aggregate.drawdown_at = point.drawdown_at;
+        }
+    }
+    result
 }
 
 fn parse_timestamp(value: &str) -> Result<DateTime<Utc>> {
