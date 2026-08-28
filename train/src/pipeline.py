@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from bybit import BybitInstrumentRule, fetch_linear_perpetual_rules
+from bybit import BybitInstrumentRule, fetch_copy_trading_base_symbols, fetch_linear_perpetual_rules
 from config import ExperimentConfig
 from data import data_fingerprint, load_context, load_panel, save_context, validate_data
 from portfolio import (
@@ -41,16 +41,24 @@ def model_spec(config: ExperimentConfig) -> ModelSpec:
     return ModelSpec(horizon=int(config.raw["model"]["horizon"]))
 
 
+def configured_symbol_allowlist(config: ExperimentConfig) -> frozenset[str] | None:
+    if not bool(config.section("data").get("copy_trading_only", False)):
+        return None
+    return fetch_copy_trading_base_symbols()
+
+
 def feature_cache_dir(config: ExperimentConfig) -> Path:
     data = config.section("data")
+    allowed_symbols = configured_symbol_allowlist(config)
     key = (
-        f"{data_fingerprint(config.data_dir)}_{FEATURE_VERSION}"
+        f"{data_fingerprint(config.data_dir, allowed_symbols)}_{FEATURE_VERSION}"
         f"_age{data['min_history_days']}_u{data['feature_universe_max']}"
     )
     return config.cache_dir / f"features_{key}"
 
 
 def prediction_cache_file(config: ExperimentConfig, spec: ModelSpec, seed: int) -> Path:
+    allowed_symbols = configured_symbol_allowlist(config)
     relevant = {
         "backend": config.section("backend"),
         "data": config.section("data"),
@@ -58,7 +66,7 @@ def prediction_cache_file(config: ExperimentConfig, spec: ModelSpec, seed: int) 
         "horizon": spec.horizon,
         "seed": seed,
         "feature_version": FEATURE_VERSION,
-        "data_fingerprint": data_fingerprint(config.data_dir),
+        "data_fingerprint": data_fingerprint(config.data_dir, allowed_symbols),
     }
     digest = hashlib.sha256(json.dumps(relevant, sort_keys=True, default=str).encode()).hexdigest()[:16]
     return config.cache_dir / "predictions" / f"{config.backend}_h{spec.horizon}_s{seed}_{digest}.npz"
@@ -71,7 +79,7 @@ def get_context(config: ExperimentConfig, reuse: bool = True) -> dict[str, Any]:
         return load_context(cache, mmap=True)
 
     LOG.info("Loading data from %s", config.data_dir)
-    panel = load_panel(config.data_dir)
+    panel = load_panel(config.data_dir, configured_symbol_allowlist(config))
     data = config.section("data")
     LOG.info("Building features for %d assets x %d days", len(panel["symbols"]), len(panel["dates"]))
     ctx = build_features(
@@ -203,8 +211,12 @@ def _bybit_rule_table(symbols: list[str], rules: dict[str, BybitInstrumentRule])
                 "base_symbol": base,
                 "bybit_symbol": bybit_symbol,
                 "tradable_linear_perpetual": bool(rule and rule.tradable_linear_perpetual),
+                "copy_tradable_usdt_perpetual": bool(rule and rule.copy_tradable_usdt_perpetual),
                 "status": rule.status if rule else "missing",
                 "contract_type": rule.contract_type if rule else "missing",
+                "quote_coin": rule.quote_coin if rule else "missing",
+                "settle_coin": rule.settle_coin if rule else "missing",
+                "copy_trading": rule.copy_trading if rule else "missing",
                 "qty_step": rule.qty_step if rule else np.nan,
                 "min_order_qty": rule.min_order_qty if rule else np.nan,
                 "min_notional_value": rule.min_notional_value if rule else np.nan,
@@ -287,6 +299,20 @@ def backtest(
     output = _run_directory(config)
     (output / "config_resolved.yaml").write_text(yaml.safe_dump(config.raw, sort_keys=False), encoding="utf-8")
     (output / "environment.txt").write_text(environment_text(), encoding="utf-8")
+    (output / "training_universe.json").write_text(
+        json.dumps(
+            {
+                "selection": (
+                    "Bybit Copy Trading API"
+                    if config.section("data").get("copy_trading_only", False)
+                    else "all local data symbols"
+                ),
+                "symbols": list(ctx["symbols"]),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     _bybit_rule_table(list(ctx["symbols"]), bybit_rules).to_csv(output / "bybit_symbol_rules.csv", index=False)
 
     mask = (dates >= pd.Timestamp(oos_start)) & (dates <= pd.Timestamp(effective_end))
@@ -361,7 +387,7 @@ def backtest(
     metadata = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "config_hash": config.config_hash,
-        "data_fingerprint": data_fingerprint(config.data_dir),
+        "data_fingerprint": data_fingerprint(config.data_dir, configured_symbol_allowlist(config)),
         "git_commit": git_commit(config.root),
         "output": str(output),
     }
@@ -389,7 +415,8 @@ def doctor(config: ExperimentConfig) -> dict[str, Any]:
     config.cache_dir.mkdir(parents=True, exist_ok=True)
     (config.root / "outputs").mkdir(parents=True, exist_ok=True)
     module = importlib.import_module(config.backend)
-    diagnostics = validate_data(config.data_dir)
+    allowed_symbols = configured_symbol_allowlist(config)
+    diagnostics = validate_data(config.data_dir, allowed_symbols)
     diagnostics.update(
         {
             "config": str(config.path),
@@ -400,6 +427,7 @@ def doctor(config: ExperimentConfig) -> dict[str, Any]:
             "horizon": model_spec(config).horizon,
             "seeds": [int(seed) for seed in config.section("training")["seeds"]],
             "aggregation": config.section("ensemble")["method"],
+            "symbol_allowlist_size": len(allowed_symbols) if allowed_symbols is not None else None,
         }
     )
     return diagnostics

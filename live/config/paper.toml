@@ -23,3 +23,4 @@ rest_parallelism = 12
 ws_batch_size = 10
 close_grace_seconds = 90
 minimum_confirmed_coverage = 0.80
+copy_trading_only = false

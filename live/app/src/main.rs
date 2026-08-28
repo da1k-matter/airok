@@ -84,6 +84,8 @@ struct BybitConfig {
     ws_batch_size: usize,
     close_grace_seconds: u64,
     minimum_confirmed_coverage: f64,
+    #[serde(default)]
+    copy_trading_only: bool,
 }
 
 #[derive(Clone)]
@@ -440,6 +442,7 @@ fn aggregate_history_bucket(
 struct InstrumentRuleCache {
     refreshed_for: Option<NaiveDate>,
     rules: BTreeMap<String, InstrumentRules>,
+    copy_trading_symbols: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1246,10 +1249,14 @@ async fn decide_for_latest(
     for (base, weight) in market.symbols.iter().zip(target) {
         if weight.abs() > 1e-10 {
             let symbol = bybit_linear_symbol(base);
-            if is_tradable(&state.instrument_rules, &symbol) {
+            if is_execution_eligible(
+                &state.instrument_rules,
+                &symbol,
+                config.bybit.copy_trading_only,
+            ) {
                 desired.insert(symbol, weight * equity * config.paper.gross_leverage);
             } else {
-                eprintln!("skip {symbol}: unavailable or not a Trading Bybit linear perpetual");
+                eprintln!("skip {symbol}: unavailable for the configured execution universe");
             }
         }
     }
@@ -1275,6 +1282,7 @@ async fn decide_for_latest(
         &client,
         desired,
         &state.instrument_rules,
+        config.bybit.copy_trading_only,
         config.bybit.orderbook_depth,
         config.bybit.rest_parallelism,
     )
@@ -1348,13 +1356,14 @@ async fn refresh_instrument_rules(state: &AppState, client: &BybitPublicClient) 
     if state.instrument_rules.lock().refreshed_for == Some(today) {
         return Ok(());
     }
-    let rules = client.linear_instrument_rules().await?;
-    if rules.is_empty() {
+    let snapshot = client.linear_instrument_snapshot().await?;
+    if snapshot.rules.is_empty() {
         bail!("Bybit returned an empty linear instrument rule snapshot");
     }
     *state.instrument_rules.lock() = InstrumentRuleCache {
         refreshed_for: Some(today),
-        rules,
+        rules: snapshot.rules,
+        copy_trading_symbols: snapshot.copy_trading_symbols,
     };
     Ok(())
 }
@@ -1367,10 +1376,24 @@ fn is_tradable(rules: &Arc<Mutex<InstrumentRuleCache>>, symbol: &str) -> bool {
         .is_some_and(InstrumentRules::is_tradable_linear_perpetual)
 }
 
+fn is_execution_eligible(
+    rules: &Arc<Mutex<InstrumentRuleCache>>,
+    symbol: &str,
+    copy_trading_only: bool,
+) -> bool {
+    let cache = rules.lock();
+    cache
+        .rules
+        .get(symbol)
+        .is_some_and(InstrumentRules::is_tradable_linear_perpetual)
+        && (!copy_trading_only || cache.copy_trading_symbols.contains(symbol))
+}
+
 async fn fetch_execution_inputs(
     client: &BybitPublicClient,
     desired: BTreeMap<String, f64>,
     rules_cache: &Arc<Mutex<InstrumentRuleCache>>,
+    copy_trading_only: bool,
     orderbook_depth: u16,
     parallelism: usize,
 ) -> Vec<(String, f64, InstrumentRules, OrderBookSnapshot)> {
@@ -1379,10 +1402,13 @@ async fn fetch_execution_inputs(
             let client = client.clone();
             let rules_cache = Arc::clone(rules_cache);
             async move {
-                let rules = match rules_cache.lock().rules.get(&symbol).cloned() {
-                    Some(rules) if rules.is_tradable_linear_perpetual() => rules,
+                let rules = match rules_cache.lock() {
+                    cache if cache.rules.get(&symbol).is_some_and(InstrumentRules::is_tradable_linear_perpetual)
+                        && (!copy_trading_only || cache.copy_trading_symbols.contains(&symbol) || notional == 0.0) => {
+                        cache.rules.get(&symbol).cloned().expect("rule was checked")
+                    }
                     _ => {
-                        eprintln!("skip {symbol}: instrument is unavailable or not tradable");
+                        eprintln!("skip {symbol}: instrument is unavailable for the configured execution universe");
                         return None;
                     }
                 };
@@ -1941,7 +1967,13 @@ async fn app_js() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::should_bootstrap_previous_day;
+    use super::{InstrumentRuleCache, is_execution_eligible, should_bootstrap_previous_day};
+    use parking_lot::Mutex;
+    use rt_domain::InstrumentRules;
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
+    };
 
     #[test]
     fn bootstrap_is_default_only_for_a_fresh_paper_ledger() {
@@ -1949,5 +1981,34 @@ mod tests {
         assert!(!should_bootstrap_previous_day(true, true));
         assert!(!should_bootstrap_previous_day(false, false));
         assert!(!should_bootstrap_previous_day(false, true));
+    }
+
+    #[test]
+    fn copy_trading_filter_excludes_only_new_unsupported_targets() {
+        let rules = Arc::new(Mutex::new(InstrumentRuleCache {
+            refreshed_for: None,
+            rules: BTreeMap::from([(
+                "BTCUSDT".to_owned(),
+                InstrumentRules {
+                    symbol: "BTCUSDT".to_owned(),
+                    status: "Trading".to_owned(),
+                    contract_type: "LinearPerpetual".to_owned(),
+                    qty_step: 0.001,
+                    min_qty: 0.001,
+                    min_notional_value: 5.0,
+                    max_market_order_qty: 150.0,
+                    tick_size: 0.1,
+                },
+            )]),
+            copy_trading_symbols: BTreeSet::new(),
+        }));
+
+        assert!(is_execution_eligible(&rules, "BTCUSDT", false));
+        assert!(!is_execution_eligible(&rules, "BTCUSDT", true));
+        rules
+            .lock()
+            .copy_trading_symbols
+            .insert("BTCUSDT".to_owned());
+        assert!(is_execution_eligible(&rules, "BTCUSDT", true));
     }
 }

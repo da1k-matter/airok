@@ -12,18 +12,21 @@ import pandas as pd
 REQUIRED_COLUMNS = ("timestamp", "open", "high", "low", "close", "volume")
 
 
-def list_data_files(data_dir: Path) -> list[Path]:
+def list_data_files(data_dir: Path, allowed_symbols: frozenset[str] | None = None) -> list[Path]:
     files = sorted(data_dir.glob("*_1440.csv"))
+    if allowed_symbols is not None:
+        files = [path for path in files if path.name.removesuffix("_1440.csv") in allowed_symbols]
     if not files:
         raise FileNotFoundError(f"No *_1440.csv files in {data_dir}")
     return files
 
 
 @lru_cache(maxsize=8)
-def _stable_data_fingerprint(resolved_directory: str) -> str:
+def _stable_data_fingerprint(resolved_directory: str, allowed_symbols: tuple[str, ...] | None) -> str:
     directory = Path(resolved_directory)
     digest = hashlib.sha256()
-    for path in list_data_files(directory):
+    allowed = frozenset(allowed_symbols) if allowed_symbols is not None else None
+    for path in list_data_files(directory, allowed):
         digest.update(path.name.encode())
         digest.update(b"\0")
         stat = path.stat()
@@ -37,13 +40,14 @@ def _stable_data_fingerprint(resolved_directory: str) -> str:
     return digest.hexdigest()[:16]
 
 
-def data_fingerprint(data_dir: Path) -> str:
+def data_fingerprint(data_dir: Path, allowed_symbols: frozenset[str] | None = None) -> str:
     """Fast stable-enough cache fingerprint based on names, sizes and file edges."""
-    return _stable_data_fingerprint(str(data_dir.resolve()))
+    selected = tuple(sorted(allowed_symbols)) if allowed_symbols is not None else None
+    return _stable_data_fingerprint(str(data_dir.resolve()), selected)
 
 
-def validate_data(data_dir: Path) -> dict[str, Any]:
-    files = list_data_files(data_dir)
+def validate_data(data_dir: Path, allowed_symbols: frozenset[str] | None = None) -> dict[str, Any]:
+    files = list_data_files(data_dir, allowed_symbols)
     starts: list[pd.Timestamp] = []
     ends: list[pd.Timestamp] = []
     symbols: list[str] = []
@@ -75,12 +79,12 @@ def validate_data(data_dir: Path) -> dict[str, Any]:
         "asset_count": len(symbols),
         "start": str(min(starts).date()),
         "end": str(max(ends).date()),
-        "fingerprint": data_fingerprint(data_dir),
+        "fingerprint": data_fingerprint(data_dir, allowed_symbols),
     }
 
 
-def load_panel(data_dir: Path) -> dict[str, Any]:
-    files = list_data_files(data_dir)
+def load_panel(data_dir: Path, allowed_symbols: frozenset[str] | None = None) -> dict[str, Any]:
+    files = list_data_files(data_dir, allowed_symbols)
     frames: list[tuple[Path, pd.DataFrame]] = []
     start: pd.Timestamp | None = None
     end: pd.Timestamp | None = None

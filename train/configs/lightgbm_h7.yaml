@@ -20,6 +20,7 @@ backend:
 
 data:
   directory: data/1d
+  copy_trading_only: false
   min_history_days: 180
   feature_universe_max: 150
 cache:

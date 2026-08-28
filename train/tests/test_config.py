@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
     ("name", "backend", "horizon", "seeds"),
     [
         ("lightgbm_h7.yaml", "lightgbm", 7, 5),
+        ("lightgbm_h7_copytrading.yaml", "lightgbm", 7, 5),
     ],
 )
 def test_presets_load(name, backend, horizon, seeds):

@@ -28,6 +28,18 @@ Open `http://127.0.0.1:8789`. Readiness is confirmed by `GET /health` and the de
 
 The default runtime configuration reads the shared historical candle directory at `../train/data/1d` for bootstrap only. It writes no research artifacts there. Change `[data].directory` if the deployed service maintains its own market-history store.
 
+### Copy Trading execution universe
+
+Set `bybit.copy_trading_only = true` to query Bybit's public instrument API at
+each daily refresh and permit new targets only when the API reports all of:
+`status=Trading`, `contractType=LinearPerpetual`, `quoteCoin=USDT`,
+`settleCoin=USDT`, and `copyTrading=both`. The full immutable model universe
+is still subscribed and used for scoring; filtering it would violate a bundle's
+feature contract. Existing positions remain reducible even if a contract later
+loses Copy Trading availability. Exporting a bundle from the corresponding
+`train/configs/lightgbm_h7_copytrading.yaml` recipe produces an immutable
+model universe containing only these eligible symbols.
+
 ### Performance history
 
 The ledger keeps one latest mark-to-market equity point for every observed UTC minute without a retention limit. Maximum drawdown is updated from every incoming mark, including multiple symbol updates inside the same minute. The dashboard requests only enough extrema-preserving time buckets for the current canvas width, so long histories remain inexpensive to transfer and render while the complete minute series stays in SQLite.

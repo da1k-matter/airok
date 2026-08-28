@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from config import ExperimentConfig, load_config
+from bybit import fetch_copy_trading_base_symbols
 from data import load_panel
 from research import build_features, make_targets, panel_to_rows
 
@@ -68,8 +69,9 @@ def main() -> None:
     data = config.section("data")
     training = config.section("training")
     horizon_days = int(config.section("model")["horizon"])
+    allowed_symbols = fetch_copy_trading_base_symbols() if data.get("copy_trading_only", False) else None
     ctx = build_features(
-        load_panel(config.data_dir),
+        load_panel(config.data_dir, allowed_symbols),
         min_age=int(data["min_history_days"]),
         max_universe=int(data["feature_universe_max"]),
     )

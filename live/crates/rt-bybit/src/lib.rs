@@ -5,7 +5,7 @@ use reqwest::Client;
 use rt_domain::{Candle, OrderBookSnapshot, PriceLevel};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use tokio::time::{self, Instant};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
@@ -31,6 +31,11 @@ pub struct BybitPublicClient {
     http: Client,
     rest_url: String,
     ws_url: String,
+}
+
+pub struct LinearInstrumentSnapshot {
+    pub rules: BTreeMap<String, rt_domain::InstrumentRules>,
+    pub copy_trading_symbols: BTreeSet<String>,
 }
 
 impl Default for BybitPublicClient {
@@ -78,12 +83,11 @@ impl BybitPublicClient {
     }
 
     /// Fetch the complete current Bybit linear-instrument rule set for one daily decision.
-    pub async fn linear_instrument_rules(
-        &self,
-    ) -> Result<BTreeMap<String, rt_domain::InstrumentRules>> {
+    pub async fn linear_instrument_snapshot(&self) -> Result<LinearInstrumentSnapshot> {
         let url = format!("{}/v5/market/instruments-info", self.rest_url);
         let mut cursor: Option<String> = None;
         let mut rules = BTreeMap::new();
+        let mut copy_trading_symbols = BTreeSet::new();
         loop {
             let mut request = self
                 .http
@@ -106,12 +110,19 @@ impl BybitPublicClient {
                 .result
                 .context("Bybit instrument rules response missing result")?;
             for instrument in result.list {
+                let is_copy_trading_symbol = is_copy_trading_usdt_perpetual(&instrument);
                 let rule = to_instrument_rule(instrument)?;
+                if is_copy_trading_symbol {
+                    copy_trading_symbols.insert(rule.symbol.clone());
+                }
                 rules.insert(rule.symbol.clone(), rule);
             }
             cursor = result.next_page_cursor.filter(|value| !value.is_empty());
             if cursor.is_none() {
-                return Ok(rules);
+                return Ok(LinearInstrumentSnapshot {
+                    rules,
+                    copy_trading_symbols,
+                });
             }
         }
     }
@@ -399,10 +410,24 @@ struct InstrumentInfo {
     status: String,
     #[serde(rename = "contractType")]
     contract_type: String,
+    #[serde(rename = "quoteCoin")]
+    quote_coin: String,
+    #[serde(rename = "settleCoin")]
+    settle_coin: String,
+    #[serde(rename = "copyTrading")]
+    copy_trading: String,
     #[serde(rename = "lotSizeFilter")]
     lot_size_filter: LotSizeFilter,
     #[serde(rename = "priceFilter")]
     price_filter: PriceFilter,
+}
+
+fn is_copy_trading_usdt_perpetual(instrument: &InstrumentInfo) -> bool {
+    instrument.status == "Trading"
+        && instrument.contract_type == "LinearPerpetual"
+        && instrument.quote_coin == "USDT"
+        && instrument.settle_coin == "USDT"
+        && instrument.copy_trading == "both"
 }
 
 #[derive(Debug, Deserialize)]
@@ -564,7 +589,10 @@ fn is_subscription_ack(source: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{base_symbol, bybit_linear_symbol, is_subscription_ack, parse_ws_kline};
+    use super::{
+        InstrumentInfo, base_symbol, bybit_linear_symbol, is_copy_trading_usdt_perpetual,
+        is_subscription_ack, parse_ws_kline,
+    };
 
     #[test]
     fn accepts_only_confirmed_daily_kline() {
@@ -608,5 +636,27 @@ mod tests {
         assert_eq!(bybit_linear_symbol("BTC"), "BTCUSDT");
         assert_eq!(base_symbol("BTCUSDT").expect("base"), "BTC");
         assert!(base_symbol("BTCUSD").is_err());
+    }
+
+    #[test]
+    fn recognizes_only_copy_trading_usdt_linear_perpetuals() {
+        let source = r#"{
+            "symbol":"BTCUSDT",
+            "status":"Trading",
+            "contractType":"LinearPerpetual",
+            "quoteCoin":"USDT",
+            "settleCoin":"USDT",
+            "copyTrading":"both",
+            "lotSizeFilter":{"qtyStep":"0.001","minOrderQty":"0.001","minNotionalValue":"5","maxMktOrderQty":"150"},
+            "priceFilter":{"tickSize":"0.1"}
+        }"#;
+        let eligible: InstrumentInfo = serde_json::from_str(source).expect("instrument payload");
+        assert!(is_copy_trading_usdt_perpetual(&eligible));
+
+        let unavailable: InstrumentInfo = serde_json::from_str(
+            &source.replace("\"copyTrading\":\"both\"", "\"copyTrading\":\"none\""),
+        )
+        .expect("instrument payload");
+        assert!(!is_copy_trading_usdt_perpetual(&unavailable));
     }
 }

@@ -92,6 +92,10 @@ def _validate(raw: dict[str, Any]) -> None:
     if horizon <= 0:
         raise ValueError("Model horizon must be positive")
 
+    data = raw["data"]
+    if not isinstance(data, dict) or not isinstance(data.get("copy_trading_only", False), bool):
+        raise ValueError("data.copy_trading_only must be a boolean when provided")
+
     training = raw["training"]
     seeds = [int(seed) for seed in training.get("seeds", [])]
     if not seeds:

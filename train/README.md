@@ -24,6 +24,14 @@ python src/update_data.py --data-dir data/1d
 
 `configs/lightgbm_h7.yaml` is the production candidate: a five-seed LightGBM LambdaRank ensemble with median-rank aggregation.
 
+`configs/lightgbm_h7_copytrading.yaml` runs the same recipe on the current
+Bybit Copy Trading universe. At process start it requests Bybit linear
+instrument metadata and retains only `Trading` USDT `LinearPerpetual`
+contracts whose `copyTrading` value is `both`. The exact data-file universe is
+saved as `training_universe.json` in the run output alongside the complete API
+rule snapshot. Run it with the same command, substituting the copy-trading
+config path.
+
 ## Local artifacts
 
 `data/1d/` contains input `<SYMBOL>_1440.csv` files. Feature and prediction caches are stored in `.cache/`; run outputs are stored in `outputs/`. These directories are local and ignored by Git.
