@@ -340,6 +340,17 @@ def smooth_fixed_window(signal: np.ndarray, days: int) -> np.ndarray:
     return output
 
 
+def smooth_ewma(signal: np.ndarray, halflife: float) -> np.ndarray:
+    """Exponentially weighted average of daily signals, normalized like the fixed window."""
+    decay = 0.5 ** (1.0 / halflife)
+    output = np.zeros_like(signal, dtype=np.float32)
+    state = np.zeros(signal.shape[1], np.float64)
+    for t in range(signal.shape[0]):
+        state = decay * state + (1.0 - decay) * signal[t]
+        output[t] = state.astype(np.float32)
+    return output
+
+
 def overlay_multiplier(ctx: dict[str, Any], overlay: dict[str, Any]) -> np.ndarray:
     t_count = len(ctx["dates"])
     if not bool(overlay.get("enabled", False)):
@@ -390,7 +401,11 @@ def build_weights(
     short_scores: np.ndarray | None = None,
 ) -> np.ndarray:
     signal = build_daily_signal(ctx, scores, portfolio, short_scores)
-    weights = smooth_fixed_window(signal, int(portfolio["smoothing_days"]))
+    halflife = portfolio.get("smoothing_halflife")
+    if halflife:
+        weights = smooth_ewma(signal, float(halflife))
+    else:
+        weights = smooth_fixed_window(signal, int(portfolio["smoothing_days"]))
     vol_target = portfolio.get("vol_target") or {}
     if bool(vol_target.get("enabled", False)):
         multiplier = vol_target_multiplier(ctx, weights, vol_target)
