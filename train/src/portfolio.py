@@ -159,6 +159,19 @@ def _side_weights(volatility: np.ndarray, selected: np.ndarray, mode: str) -> np
     return values / values.sum()
 
 
+def _cross_sectional_z(ctx: dict[str, Any], name: str) -> np.ndarray:
+    source = {"size": "dvol20", "vol": "vol20"}[name]
+    values = np.asarray(ctx[source], np.float64)
+    if name == "vol":
+        values = np.log(np.maximum(values, 1e-6))
+    eligible = np.asarray(ctx["eligible_max"])
+    masked = np.where(eligible, values, np.nan)
+    with np.errstate(invalid="ignore"):
+        mean = np.nanmean(masked, axis=1, keepdims=True)
+        std = np.nanstd(masked, axis=1, keepdims=True)
+    return np.nan_to_num((values - mean) / np.where(std > 1e-12, std, 1.0))
+
+
 def alt_index_beta(ctx: dict[str, Any], window: int = 60) -> np.ndarray:
     """Rolling beta of every asset to the equal-weighted eligible-universe return, known at each close."""
     if "alt_beta60" not in ctx:
@@ -249,6 +262,9 @@ def build_daily_signal(
     scores, long_ok, short_ok = _funding_adjusted(scores, ctx, portfolio)
     alt_strength = float(portfolio.get("alt_beta_neutral", 0.0))
     alt_beta = alt_index_beta(ctx) if alt_strength > 0 else None
+    # Optional characteristic exposures neutralized in the same blended book (cross-sectional z-scores).
+    characteristic_names = list(portfolio.get("neutral_characteristics", []))
+    characteristics = [_cross_sectional_z(ctx, name) for name in characteristic_names]
 
     for t in range(t_count - 1):
         valid = (
@@ -302,7 +318,7 @@ def build_daily_signal(
             else:
                 # Partial neutralization blends the BTC-only and the BTC+alt-index neutral books.
                 blended = (1.0 - alt_strength) * btc_only + alt_strength * _project_dollar_and_beta(
-                    weights, beta[t], [alt_beta[t]]
+                    weights, beta[t], [alt_beta[t]] + [values[t] for values in characteristics]
                 )
                 gross = np.abs(blended).sum()
                 weights = blended / gross if gross > 1e-8 else blended
