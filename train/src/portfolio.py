@@ -30,6 +30,11 @@ def simulate_target_weight_pnl(weights: np.ndarray, open_to_open_return: np.ndar
     return pnl, turnover
 
 
+def target_weight_funding(weights: np.ndarray, funding_factor: np.ndarray) -> np.ndarray:
+    """Funding return of ideal target weights held from open t to open t+1."""
+    return -np.nansum(weights.astype(np.float64) * funding_factor, axis=1)
+
+
 @dataclass(frozen=True)
 class BybitExecutionSimulation:
     pnl: np.ndarray
@@ -39,6 +44,8 @@ class BybitExecutionSimulation:
     attempted_orders: np.ndarray
     executed_orders: np.ndarray
     skipped_orders: np.ndarray
+    funding_pnl: np.ndarray
+    funding_uncovered_notional: np.ndarray
 
 
 def simulate_bybit_market_pnl(
@@ -52,12 +59,17 @@ def simulate_bybit_market_pnl(
     min_order_qty: np.ndarray,
     min_notional_value: np.ndarray,
     max_market_order_qty: np.ndarray,
+    funding_factor: np.ndarray | None = None,
 ) -> BybitExecutionSimulation:
     """Execute one Bybit linear-perpetual market order per symbol and day.
 
     The order quantity is rounded down to the instrument qty step before every
     Bybit lot-size validation. Rejected deltas remain as tracking error until a
     later rebalance is valid under the same current rule snapshot.
+
+    With `funding_factor` (see funding.load_funding_factors) every position held
+    through day t pays `notional * factor[t]`; held notional on days without
+    funding coverage is reported in `funding_uncovered_notional` and pays none.
     """
     if initial_equity_usd <= 0.0 or gross_leverage <= 0.0:
         raise ValueError("Execution equity and gross leverage must be positive")
@@ -70,6 +82,8 @@ def simulate_bybit_market_pnl(
     attempted_orders = np.zeros(t_count, dtype=np.int32)
     executed_orders = np.zeros(t_count, dtype=np.int32)
     skipped_orders = np.zeros(t_count, dtype=np.int32)
+    funding_pnl = np.zeros(t_count, dtype=np.float64)
+    funding_uncovered_notional = np.zeros(t_count, dtype=np.float64)
     held_quantity = np.zeros(n_assets, dtype=np.float64)
     equity = float(initial_equity_usd)
 
@@ -102,14 +116,22 @@ def simulate_bybit_market_pnl(
         executed_orders[t] = int(executable.sum())
         skipped_orders[t] = int(rejected.sum())
         turnover[t] = executed_notional / equity
-        held_weights[t] = (held_quantity * prices / (equity * gross_leverage)).astype(np.float32)
+        position_notional = np.where(valid_price, held_quantity * prices, 0.0)
+        held_weights[t] = (position_notional / (equity * gross_leverage)).astype(np.float32)
 
         returns = open_to_open_return[t].astype(np.float64)
         valid = valid_price & np.isfinite(returns)
-        gross_pnl = float(np.dot((held_quantity * prices)[valid], returns[valid]))
+        gross_pnl = float(np.dot(position_notional[valid], returns[valid]))
         fees = one_way_cost * executed_notional
-        pnl[t] = (gross_pnl - fees) / equity
-        equity += gross_pnl - fees
+        funding = 0.0
+        if funding_factor is not None:
+            factor = funding_factor[t].astype(np.float64)
+            covered = np.isfinite(factor)
+            funding = -float(np.dot(position_notional[covered], factor[covered]))
+            funding_uncovered_notional[t] = float(np.abs(position_notional[~covered]).sum())
+            funding_pnl[t] = funding / equity
+        pnl[t] = (gross_pnl - fees + funding) / equity
+        equity += gross_pnl - fees + funding
         # Quantity is invariant between rebalances; next day's price marks it.
 
     return BybitExecutionSimulation(
@@ -120,6 +142,8 @@ def simulate_bybit_market_pnl(
         attempted_orders=attempted_orders,
         executed_orders=executed_orders,
         skipped_orders=skipped_orders,
+        funding_pnl=funding_pnl,
+        funding_uncovered_notional=funding_uncovered_notional,
     )
 
 

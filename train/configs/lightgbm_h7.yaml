@@ -53,6 +53,9 @@ portfolio:
     high_vol_multiplier: 0.75
 costs:
   one_way_bps: 10.0
+  funding:
+    enabled: true
+    directory: data/funding
 execution:
   initial_equity_usd: 1000.0
   gross_leverage: 1.0

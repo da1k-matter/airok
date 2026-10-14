@@ -17,11 +17,13 @@ import yaml
 from bybit import BybitInstrumentRule, fetch_copy_trading_base_symbols, fetch_linear_perpetual_rules
 from config import ExperimentConfig
 from data import data_fingerprint, load_context, load_panel, save_context, validate_data
+from funding import load_funding_factors
 from portfolio import (
     average_portfolios,
     build_weights,
     simulate_bybit_market_pnl,
     simulate_target_weight_pnl,
+    target_weight_funding,
 )
 from reporting import environment_text, git_commit, metrics, save_plots, yearly_table
 from research import (
@@ -227,10 +229,52 @@ def _bybit_rule_table(symbols: list[str], rules: dict[str, BybitInstrumentRule])
     return pd.DataFrame(rows)
 
 
+def funding_enabled(config: ExperimentConfig, override: bool | None = None) -> bool:
+    if override is not None:
+        return override
+    return bool((config.section("costs").get("funding") or {}).get("enabled", False))
+
+
+def _funding_summary(
+    executed: Any,
+    funding_factor: np.ndarray,
+    gross_leverage: float,
+    initial_equity: float,
+    dates: pd.DatetimeIndex,
+    start: str,
+    end: str,
+    periods_per_year: int,
+) -> dict[str, Any]:
+    mask = (dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))
+    equity = initial_equity * np.concatenate(([1.0], np.cumprod(1.0 + executed.pnl)[:-1]))
+    held = executed.held_weights.astype(np.float64) * gross_leverage
+    paid = held * np.nan_to_num(funding_factor)
+    long_side = -np.where(held > 0, paid, 0.0).sum(axis=1)
+    short_side = -np.where(held < 0, paid, 0.0).sum(axis=1)
+    gross_notional = np.abs(held).sum(axis=1) * equity
+    funding = executed.funding_pnl[mask]
+    days = max(int(mask.sum()), 1)
+    return {
+        "start": str(pd.Timestamp(start).date()),
+        "end": str(pd.Timestamp(end).date()),
+        "total_return_sum": float(funding.sum()),
+        "annualized": float(funding.mean() * periods_per_year),
+        "long_side_annualized": float(long_side[mask].sum() / days * periods_per_year),
+        "short_side_annualized": float(short_side[mask].sum() / days * periods_per_year),
+        "paying_day_ratio": float((funding < 0).mean()),
+        "worst_day": float(funding.min()),
+        "best_day": float(funding.max()),
+        "uncovered_notional_ratio": float(
+            executed.funding_uncovered_notional[mask].sum() / max(gross_notional[mask].sum(), 1e-12)
+        ),
+    }
+
+
 def backtest(
     config: ExperimentConfig,
     ctx: dict[str, Any],
     predictions: dict[int, np.ndarray],
+    funding: bool | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     evaluation = config.section("evaluation")
     periods_per_year = int(evaluation.get("periods_per_year", 365))
@@ -250,25 +294,49 @@ def backtest(
 
     cost = float(config.section("costs")["one_way_bps"]) / 10_000.0
     execution = config.section("execution")
+    use_funding = funding_enabled(config, funding)
+    funding_factor: np.ndarray | None = None
+    funding_source: dict[str, Any] = {"enabled": use_funding}
+    if use_funding:
+        funding_config = config.section("costs").get("funding") or {}
+        loaded = load_funding_factors(
+            config.resolve(funding_config.get("directory", "data/funding")),
+            dates,
+            list(ctx["symbols"]),
+            np.asarray(ctx["open"]),
+        )
+        funding_factor = loaded.pop("factor")
+        funding_source.update(loaded)
+        LOG.info("Funding loaded: %d files, %d settlements", loaded["files"], loaded["settlements"])
     ideal_pnl, ideal_turnover = simulate_target_weight_pnl(weights, np.asarray(ctx["oo_ret"]), cost)
+    ideal_funding = (
+        target_weight_funding(weights, funding_factor) if funding_factor is not None else np.zeros_like(ideal_pnl)
+    )
+    ideal_pnl = ideal_pnl + ideal_funding
     bybit_rules, bybit_snapshot = fetch_linear_perpetual_rules()
     tradable, qty_step, min_qty, min_notional, max_market_qty = _bybit_rule_arrays(
         list(ctx["symbols"]), bybit_rules
     )
     executable_targets = weights.copy()
     executable_targets[:, ~tradable] = 0.0
-    executed = simulate_bybit_market_pnl(
-        executable_targets,
-        np.asarray(ctx["open"]),
-        np.asarray(ctx["oo_ret"]),
-        cost,
-        initial_equity_usd=float(execution["initial_equity_usd"]),
-        gross_leverage=float(execution["gross_leverage"]),
-        qty_step=qty_step,
-        min_order_qty=min_qty,
-        min_notional_value=min_notional,
-        max_market_order_qty=max_market_qty,
-    )
+
+    def execute(one_way_cost: float, factor: np.ndarray | None) -> Any:
+        return simulate_bybit_market_pnl(
+            executable_targets,
+            np.asarray(ctx["open"]),
+            np.asarray(ctx["oo_ret"]),
+            one_way_cost,
+            initial_equity_usd=float(execution["initial_equity_usd"]),
+            gross_leverage=float(execution["gross_leverage"]),
+            qty_step=qty_step,
+            min_order_qty=min_qty,
+            min_notional_value=min_notional,
+            max_market_order_qty=max_market_qty,
+            funding_factor=factor,
+        )
+
+    executed = execute(cost, funding_factor)
+    without_funding = execute(cost, None) if funding_factor is not None else executed
     pnl, turnover = executed.pnl, executed.turnover
     effective_end = str(dates[end_idx].date())
     full_metrics, full_monthly = metrics(pnl, turnover, dates, oos_start, effective_end, periods_per_year)
@@ -294,7 +362,24 @@ def backtest(
             "tradable_symbols": int(tradable.sum()),
             "unavailable_symbols": int((~tradable).sum()),
         },
+        "funding": funding_source,
     }
+    if funding_factor is not None:
+        for label, start in (("full", oos_start), ("latest_year", latest_start)):
+            summary["funding"][label] = _funding_summary(
+                executed,
+                funding_factor,
+                float(execution["gross_leverage"]),
+                float(execution["initial_equity_usd"]),
+                dates,
+                start,
+                effective_end,
+                periods_per_year,
+            )
+        summary["without_funding"] = {
+            label: metrics(without_funding.pnl, without_funding.turnover, dates, start, effective_end, periods_per_year)[0]
+            for label, start in (("full", oos_start), ("latest_year", latest_start))
+        }
 
     output = _run_directory(config)
     (output / "config_resolved.yaml").write_text(yaml.safe_dump(config.raw, sort_keys=False), encoding="utf-8")
@@ -326,7 +411,10 @@ def backtest(
             "gross_exposure": np.abs(dated_weights).sum(axis=1),
             "net_exposure": dated_weights.sum(axis=1),
             "beta_exposure": beta_exposure,
+            "funding_return": executed.funding_pnl[mask],
+            "net_return_without_funding": without_funding.pnl[mask],
             "ideal_net_return": ideal_pnl[mask],
+            "ideal_funding_return": ideal_funding[mask],
             "ideal_turnover": ideal_turnover[mask],
             "rejected_notional_usd": executed.rejected_notional[mask],
             "attempted_orders": executed.attempted_orders[mask],
@@ -346,18 +434,7 @@ def backtest(
 
     fee_rows: list[dict[str, Any]] = []
     for bps in evaluation.get("fee_stress_bps", [5, 10, 15, 20, 30]):
-        fee_execution = simulate_bybit_market_pnl(
-            executable_targets,
-            np.asarray(ctx["open"]),
-            np.asarray(ctx["oo_ret"]),
-            float(bps) / 10_000.0,
-            initial_equity_usd=float(execution["initial_equity_usd"]),
-            gross_leverage=float(execution["gross_leverage"]),
-            qty_step=qty_step,
-            min_order_qty=min_qty,
-            min_notional_value=min_notional,
-            max_market_order_qty=max_market_qty,
-        )
+        fee_execution = execute(float(bps) / 10_000.0, funding_factor)
         for label, start in (("full", oos_start), ("latest_year", latest_start)):
             row, _ = metrics(fee_execution.pnl, fee_execution.turnover, dates, start, effective_end, periods_per_year)
             fee_rows.append({"one_way_bps": bps, "period": label, **row})
@@ -437,10 +514,11 @@ def run(
     config: ExperimentConfig,
     reuse_features: bool = True,
     reuse_predictions: bool = True,
+    funding: bool | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     started = time.perf_counter()
     ctx = get_context(config, reuse=reuse_features)
     predictions = train_models(config, ctx, reuse=reuse_predictions)
-    output, summary = backtest(config, ctx, predictions)
+    output, summary = backtest(config, ctx, predictions, funding=funding)
     LOG.info("Total elapsed: %.1fs", time.perf_counter() - started)
     return output, summary
