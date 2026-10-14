@@ -51,3 +51,25 @@ def test_positive_funding_is_paid_by_longs_and_received_by_shorts():
     np.testing.assert_allclose(result.funding_uncovered_notional[1], 500.0)
     np.testing.assert_allclose(result.pnl[:2], result.funding_pnl[:2])
     np.testing.assert_allclose(target_weight_funding(weights, factor)[:2], [0.0, -0.001], atol=1e-9)
+
+
+def test_net_funding_target_subtracts_settlements_of_the_holding_days():
+    from research import make_targets
+
+    t_count, horizon = 12, 3
+    opens = np.ones((t_count, 2))
+    funding = np.zeros((t_count, 2))
+    funding[:, 0] = np.arange(t_count) * 0.01  # day d pays 0.01 * d
+    ctx = {
+        "open": opens,
+        "beta60": np.zeros((t_count, 2), np.float32),
+        "eligible_max": np.ones((t_count, 2), bool),
+        "btc_idx": 1,
+        "funding_rate_day": funding,
+    }
+    plain = make_targets(ctx, horizon)["residual_rank"]
+    net = make_targets(ctx, horizon, "residual_net_funding")["residual_rank"]
+    # Decision at close 0 holds days 1..3 and pays 0.06, so asset 0 ranks below the zero-funding asset.
+    assert plain[0, 0] == plain[0, 1]
+    assert net[0, 0] < net[0, 1]
+    assert np.isnan(net[t_count - horizon - 1 :]).all()

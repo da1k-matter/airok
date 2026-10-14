@@ -185,6 +185,29 @@ def _tail_size(portfolio: dict[str, Any], universe_count: int) -> int:
     return min(count, universe_count // 2)
 
 
+def trailing_funding(ctx: dict[str, Any], lookback: int) -> np.ndarray:
+    """Annualized mean funding rate over the last `lookback` holding days, known at each close."""
+    if "funding_rate_day" not in ctx:
+        raise KeyError("portfolio.funding_select needs ctx['funding_rate_day']; see pipeline.attach_funding")
+    daily = pd.DataFrame(np.asarray(ctx["funding_rate_day"], np.float64))
+    return (daily.rolling(lookback, min_periods=1).mean().to_numpy() * 365.0).astype(np.float64)
+
+
+def _funding_adjusted(scores: np.ndarray, ctx: dict[str, Any], portfolio: dict[str, Any]):
+    """Return (scores, long_ok, short_ok) after optional funding-aware selection."""
+    options = portfolio.get("funding_select") or {}
+    mode = str(options.get("mode", "off"))
+    if mode == "off":
+        return scores, None, None
+    funding = np.nan_to_num(trailing_funding(ctx, int(options.get("lookback", 7))))
+    if mode == "penalty":
+        return scores - float(options["kappa"]) * funding, None, None
+    if mode == "filter":
+        threshold = float(options["threshold"])
+        return scores, funding <= threshold, funding >= -threshold
+    raise ValueError(f"Unknown portfolio.funding_select.mode: {mode}")
+
+
 def build_daily_signal(ctx: dict[str, Any], scores: np.ndarray, portfolio: dict[str, Any]) -> np.ndarray:
     """Create close-t signals shifted to execution at open t+1."""
     liq_rank = np.asarray(ctx["liq_rank"])
@@ -196,6 +219,7 @@ def build_daily_signal(ctx: dict[str, Any], scores: np.ndarray, portfolio: dict[
     universe_size = int(portfolio["universe_size"])
     weighting = str(portfolio["weighting"])
     minimum_universe = int(portfolio.get("minimum_universe", 20))
+    scores, long_ok, short_ok = _funding_adjusted(scores, ctx, portfolio)
 
     for t in range(t_count - 1):
         valid = (
@@ -213,8 +237,13 @@ def build_daily_signal(ctx: dict[str, Any], scores: np.ndarray, portfolio: dict[
         k = _tail_size(portfolio, index.size)
         if k < 1:
             continue
-        short_index = index[order[:k]]
-        long_index = index[order[-k:]]
+        ranked = index[order]
+        short_pool = ranked if short_ok is None else ranked[short_ok[t, ranked]]
+        long_pool = ranked if long_ok is None else ranked[long_ok[t, ranked]]
+        if short_pool.size < k or long_pool.size < k:
+            continue
+        short_index = short_pool[:k]
+        long_index = long_pool[-k:]
         weights = np.zeros(n_assets, np.float64)
         weights[long_index] = 0.5 * _side_weights(volatility[t], long_index, weighting)
         weights[short_index] = -0.5 * _side_weights(volatility[t], short_index, weighting)

@@ -16,6 +16,7 @@ FEATURE_VERSION = "v2_numeric_cross_section"
 @dataclass(frozen=True)
 class ModelSpec:
     horizon: int
+    target: str = "residual"
 
 
 def rolling_rank_pct(x: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
@@ -40,7 +41,13 @@ def rolling_max(x: np.ndarray, window: int, min_periods: int | None = None) -> n
     return pd.DataFrame(x).rolling(window, min_periods=minimum).max().to_numpy(dtype=np.float32)
 
 
-def build_features(panel: dict[str, Any], min_age: int = 180, max_universe: int = 150) -> dict[str, Any]:
+def build_features(
+    panel: dict[str, Any],
+    min_age: int = 180,
+    max_universe: int = 150,
+    funding_rate_day: np.ndarray | None = None,
+    funding_levels: bool = True,
+) -> dict[str, Any]:
     symbols: list[str] = panel["symbols"]
     o = panel["open"]
     h = panel["high"]
@@ -122,10 +129,22 @@ def build_features(panel: dict[str, Any], min_age: int = 180, max_universe: int 
     raw["mom_21_ex_3"] = raw["ret_21"] - raw["ret_3"]
     raw["mom_60_ex_7"] = raw["ret_60"] - raw["ret_7"]
 
+    levels: dict[str, np.ndarray] = {}
+    if funding_rate_day is not None:
+        # Annualized funding known at each close; missing coverage counts as zero funding.
+        funding = pd.DataFrame(np.nan_to_num(np.asarray(funding_rate_day, np.float64)) * 365.0)
+        for window in (1, 3, 7, 30):
+            raw[f"fund_{window}"] = funding.rolling(window, min_periods=1).mean().to_numpy(np.float32)
+        raw["fund_chg_7_30"] = raw["fund_7"] - raw["fund_30"]
+        if funding_levels:
+            levels["fund_7_level"] = np.clip(raw["fund_7"], -3.0, 3.0)
+            levels["fund_30_level"] = np.clip(raw["fund_30"], -3.0, 3.0)
+
     features: dict[str, np.ndarray] = {
         f"{name}_xrank": (rolling_rank_pct(values, eligible_max) - 0.5).astype(np.float32)
         for name, values in raw.items()
     }
+    features.update({name: values.astype(np.float32) for name, values in levels.items()})
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         breadth = np.nanmean(np.where(eligible_max, ret1 > 0, np.nan), axis=1)
@@ -137,6 +156,10 @@ def build_features(panel: dict[str, Any], min_age: int = 180, max_universe: int 
         "mkt_breadth": breadth,
         "mkt_dispersion": dispersion,
     }
+    if funding_rate_day is not None and funding_levels:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            regimes["mkt_fund_7"] = np.nanmedian(np.where(eligible_max, raw["fund_7"], np.nan), axis=1)
     for name, values in regimes.items():
         features[name] = np.broadcast_to(values[:, None], c.shape).astype(np.float32)
 
@@ -160,7 +183,7 @@ def build_features(panel: dict[str, Any], min_age: int = 180, max_universe: int 
     }
 
 
-def make_targets(ctx: dict[str, Any], horizon: int) -> dict[str, np.ndarray]:
+def make_targets(ctx: dict[str, Any], horizon: int, target: str = "residual") -> dict[str, np.ndarray]:
     o = ctx["open"]
     beta = ctx["beta60"]
     eligible = ctx["eligible_max"]
@@ -169,6 +192,15 @@ def make_targets(ctx: dict[str, Any], horizon: int) -> dict[str, np.ndarray]:
     future[: -(horizon + 1)] = np.log(o[horizon + 1 :] / o[1:-horizon])
     btc_future = future[:, int(ctx["btc_idx"])]
     residual = future - beta * btc_future[:, None]
+    if target == "residual_net_funding":
+        # A position opened at open t+1 pays the settlements of holding days t+1 .. t+horizon.
+        daily = np.nan_to_num(np.asarray(ctx["funding_rate_day"], np.float64))
+        cumulative = np.vstack([np.zeros((1, n_assets)), np.cumsum(daily, axis=0)])
+        paid = np.full((t_count, n_assets), np.nan, np.float32)
+        paid[: -(horizon + 1)] = cumulative[horizon + 1 : t_count] - cumulative[1 : t_count - horizon]
+        residual = residual - paid
+    elif target != "residual":
+        raise ValueError(f"Unknown model.target: {target!r}")
     mask = eligible & np.isfinite(future)
     residual_rank = rolling_rank_pct(residual, mask)
     decile = np.floor(np.clip(residual_rank, 0.0, 0.999999) * 10.0).astype(np.float32)
@@ -260,7 +292,7 @@ def train_walk_forward(
     date_rows = rows["date_idx"]
     asset_rows = rows["asset_idx"]
     x_all = rows["X"]
-    target = make_targets(ctx, spec.horizon)["decile"]
+    target = make_targets(ctx, spec.horizon, spec.target)["decile"]
     y_all = target[date_rows, asset_rows]
     scores = np.full((t_count, n_assets), np.nan, np.float32)
 

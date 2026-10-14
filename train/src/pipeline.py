@@ -40,7 +40,23 @@ LOG = logging.getLogger(__name__)
 
 
 def model_spec(config: ExperimentConfig) -> ModelSpec:
-    return ModelSpec(horizon=int(config.raw["model"]["horizon"]))
+    model = config.section("model")
+    return ModelSpec(horizon=int(model["horizon"]), target=str(model.get("target", "residual")))
+
+
+def model_specs(config: ExperimentConfig) -> list[ModelSpec]:
+    """One spec per ensemble horizon (`model.horizons`), defaulting to `model.horizon`."""
+    base = model_spec(config)
+    horizons = config.section("model").get("horizons") or [base.horizon]
+    return [ModelSpec(horizon=int(horizon), target=base.target) for horizon in horizons]
+
+
+def uses_funding_features(config: ExperimentConfig) -> bool:
+    return bool(config.section("features").get("funding", False))
+
+
+def funding_levels(config: ExperimentConfig) -> bool:
+    return config.section("features").get("funding") != "rank_only"
 
 
 def configured_symbol_allowlist(config: ExperimentConfig) -> frozenset[str] | None:
@@ -55,23 +71,37 @@ def feature_cache_dir(config: ExperimentConfig) -> Path:
     key = (
         f"{data_fingerprint(config.data_dir, allowed_symbols)}_{FEATURE_VERSION}"
         f"_age{data['min_history_days']}_u{data['feature_universe_max']}"
+        f"{('_fund' if funding_levels(config) else '_fundrank') if uses_funding_features(config) else ''}"
     )
     return config.cache_dir / f"features_{key}"
 
 
-def prediction_cache_file(config: ExperimentConfig, spec: ModelSpec, seed: int) -> Path:
+def prediction_cache_file(config: ExperimentConfig, spec: ModelSpec, seed: int, phase_offset: int = 0) -> Path:
     allowed_symbols = configured_symbol_allowlist(config)
+    # A model depends on its own seed and schedule, not on the other ensemble members.
+    training = {
+        key: value for key, value in config.section("training").items() if key not in {"phase_offsets", "seeds"}
+    }
+    if phase_offset:
+        training["prediction_start"] = str(phase_start(config, phase_offset).date())
     relevant = {
         "backend": config.section("backend"),
         "data": config.section("data"),
-        "training": config.section("training"),
+        "training": training,
         "horizon": spec.horizon,
+        "features": config.section("features"),
+        "model": {**{k: v for k, v in config.section("model").items() if k != "horizons"}, "horizon": spec.horizon},
         "seed": seed,
         "feature_version": FEATURE_VERSION,
         "data_fingerprint": data_fingerprint(config.data_dir, allowed_symbols),
     }
     digest = hashlib.sha256(json.dumps(relevant, sort_keys=True, default=str).encode()).hexdigest()[:16]
     return config.cache_dir / "predictions" / f"{config.backend}_h{spec.horizon}_s{seed}_{digest}.npz"
+
+
+def phase_start(config: ExperimentConfig, phase_offset: int) -> pd.Timestamp:
+    """Walk-forward schedule shifted earlier by `phase_offset` days; every phase covers the same OOS."""
+    return pd.Timestamp(config.section("training")["prediction_start"]) - pd.Timedelta(days=phase_offset)
 
 
 def get_context(config: ExperimentConfig, reuse: bool = True) -> dict[str, Any]:
@@ -84,11 +114,19 @@ def get_context(config: ExperimentConfig, reuse: bool = True) -> dict[str, Any]:
     panel = load_panel(config.data_dir, configured_symbol_allowlist(config))
     data = config.section("data")
     LOG.info("Building features for %d assets x %d days", len(panel["symbols"]), len(panel["dates"]))
+    funding_rate_day = None
+    if uses_funding_features(config):
+        directory = config.resolve((config.section("costs").get("funding") or {}).get("directory", "data/funding"))
+        funding_rate_day = load_funding_factors(directory, panel["dates"], panel["symbols"], panel["open"])["rate_sum"]
     ctx = build_features(
         panel,
         min_age=int(data["min_history_days"]),
         max_universe=int(data["feature_universe_max"]),
+        funding_rate_day=funding_rate_day,
+        funding_levels=funding_levels(config),
     )
+    if funding_rate_day is not None:
+        ctx["funding_rate_day"] = funding_rate_day.astype(np.float32)
     if cache.exists():
         shutil.rmtree(cache)
     save_context(ctx, cache)
@@ -101,16 +139,30 @@ def train_models(
     ctx: dict[str, Any],
     reuse: bool = True,
 ) -> dict[int, np.ndarray]:
+    if model_spec(config).target == "residual_net_funding":
+        attach_funding(config, ctx)
+    specs = model_specs(config)
+    if len(specs) > 1:
+        outputs: dict[Any, np.ndarray] = {}
+        for spec in specs:
+            for key, scores in _train_spec(config, ctx, spec, reuse).items():
+                outputs[(spec.horizon, key)] = scores
+        return outputs
+    return _train_spec(config, ctx, specs[0], reuse)
+
+
+def _train_spec(config: ExperimentConfig, ctx: dict[str, Any], spec: ModelSpec, reuse: bool) -> dict[Any, np.ndarray]:
     rows = panel_to_rows(ctx)
     training = config.section("training")
-    prediction_start = pd.Timestamp(training["prediction_start"])
     prediction_end = pd.Timestamp(training.get("prediction_end", ctx["dates"][-1]))
     backend_params = config.section("backend").get("params", {})
-    spec = model_spec(config)
-    outputs: dict[int, np.ndarray] = {}
+    outputs: dict[Any, np.ndarray] = {}
+    offsets = [int(value) for value in training.get("phase_offsets", [0])]
+    runs = [(int(seed), offset) for offset in offsets for seed in training["seeds"]]
 
-    for seed in [int(value) for value in training["seeds"]]:
-        path = prediction_cache_file(config, spec, seed)
+    for seed, offset in runs:
+        prediction_start = phase_start(config, offset)
+        path = prediction_cache_file(config, spec, seed, offset)
         if reuse and path.exists():
             LOG.info("Prediction cache hit: %s", path)
             scores = np.load(path, allow_pickle=False)["scores"]
@@ -129,8 +181,17 @@ def train_models(
             )
             np.savez_compressed(path, scores=scores.astype(np.float32))
             LOG.info("Prediction cache saved: %s", path)
-        outputs[seed] = scores
+        outputs[seed if len(offsets) == 1 else (seed, offset)] = scores
     return outputs
+
+
+def attach_funding(config: ExperimentConfig, ctx: dict[str, Any]) -> None:
+    """Add daily funding-rate sums (known at each close) to the context once."""
+    if "funding_rate_day" in ctx:
+        return
+    directory = config.resolve((config.section("costs").get("funding") or {}).get("directory", "data/funding"))
+    loaded = load_funding_factors(directory, ctx["dates"], list(ctx["symbols"]), np.asarray(ctx["open"]))
+    ctx["funding_rate_day"] = loaded["rate_sum"].astype(np.float32)
 
 
 def build_ensemble_weights(
@@ -138,6 +199,8 @@ def build_ensemble_weights(
     ctx: dict[str, Any],
     predictions: dict[int, np.ndarray],
 ) -> tuple[np.ndarray, dict[int, np.ndarray]]:
+    if (config.section("portfolio").get("funding_select") or {}).get("mode", "off") != "off":
+        attach_funding(config, ctx)
     eligible = np.asarray(ctx["eligible_max"])
     seed_scores = {seed: rank_model_scores(scores, eligible) for seed, scores in predictions.items()}
     ensemble = config.section("ensemble")

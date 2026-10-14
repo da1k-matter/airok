@@ -14,6 +14,10 @@ asset j during day t:
 
 where the unobserved mark price at s is interpolated linearly between open t
 and open t+1. Funding P&L of a held notional is `-notional * factor`.
+
+`rate_sum[t, j]` is the plain sum of those rates. It is fully known at the
+close of day t (the last settlement is at 00:00 t+1, before the rebalance), so
+it may be used by signals formed at that close.
 """
 
 from __future__ import annotations
@@ -38,6 +42,7 @@ def load_funding_factors(
         raise FileNotFoundError(f"Funding directory {directory} does not exist; run scraper_bybit.py --funding")
     t_count, n_assets = open_prices.shape
     factor = np.full((t_count, n_assets), np.nan, np.float64)
+    rate_sum = np.full((t_count, n_assets), np.nan, np.float64)
     date0 = pd.Timestamp(dates[0])
     files = 0
     settlements = 0
@@ -68,7 +73,10 @@ def load_funding_factors(
         column = factor[:, j]
         column[day.min() : day.max() + 1] = 0.0
         np.add.at(column, day, rate * price_ratio)
+        rates = rate_sum[:, j]
+        rates[day.min() : day.max() + 1] = 0.0
+        np.add.at(rates, day, rate)
         files += 1
         settlements += int(day.size)
 
-    return {"factor": factor, "files": files, "settlements": settlements, "directory": str(directory)}
+    return {"factor": factor, "rate_sum": rate_sum, "files": files, "settlements": settlements, "directory": str(directory)}
