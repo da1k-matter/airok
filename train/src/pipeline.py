@@ -48,7 +48,8 @@ def model_specs(config: ExperimentConfig) -> list[ModelSpec]:
     """One spec per ensemble horizon (`model.horizons`), defaulting to `model.horizon`."""
     base = model_spec(config)
     horizons = config.section("model").get("horizons") or [base.horizon]
-    return [ModelSpec(horizon=int(horizon), target=base.target) for horizon in horizons]
+    sides = ["long", "short"] if bool(config.section("model").get("short_model", False)) else ["long"]
+    return [ModelSpec(horizon=int(horizon), target=base.target, side=side) for side in sides for horizon in horizons]
 
 
 def uses_funding_features(config: ExperimentConfig) -> bool:
@@ -90,7 +91,11 @@ def prediction_cache_file(config: ExperimentConfig, spec: ModelSpec, seed: int, 
         "training": training,
         "horizon": spec.horizon,
         "features": config.section("features"),
-        "model": {**{k: v for k, v in config.section("model").items() if k != "horizons"}, "horizon": spec.horizon},
+        "model": {
+            **{k: v for k, v in config.section("model").items() if k not in {"horizons", "short_model"}},
+            "horizon": spec.horizon,
+            **({"side": "short"} if spec.side == "short" else {}),
+        },
         "seed": seed,
         "feature_version": FEATURE_VERSION,
         "data_fingerprint": data_fingerprint(config.data_dir, allowed_symbols),
@@ -146,7 +151,7 @@ def train_models(
         outputs: dict[Any, np.ndarray] = {}
         for spec in specs:
             for key, scores in _train_spec(config, ctx, spec, reuse).items():
-                outputs[(spec.horizon, key)] = scores
+                outputs[(spec.side, spec.horizon, key) if spec.side == "short" else (spec.horizon, key)] = scores
         return outputs
     return _train_spec(config, ctx, specs[0], reuse)
 
@@ -202,6 +207,18 @@ def build_ensemble_weights(
     if (config.section("portfolio").get("funding_select") or {}).get("mode", "off") != "off":
         attach_funding(config, ctx)
     eligible = np.asarray(ctx["eligible_max"])
+    short_keys = [key for key in predictions if isinstance(key, tuple) and key[0] == "short"]
+    if short_keys:
+        long_ranks = [rank_model_scores(v, eligible) for k, v in predictions.items() if k not in short_keys]
+        short_ranks = [1.0 - rank_model_scores(predictions[k], eligible) for k in short_keys]
+        method = str(config.section("ensemble")["method"])
+        weights = build_weights(
+            ctx,
+            aggregate_seed_ranks(long_ranks, method),
+            config.section("portfolio"),
+            short_scores=aggregate_seed_ranks(short_ranks, method),
+        )
+        return weights.astype(np.float32), dict(enumerate(long_ranks))
     seed_scores = {seed: rank_model_scores(scores, eligible) for seed, scores in predictions.items()}
     ensemble = config.section("ensemble")
     method = str(ensemble["method"])

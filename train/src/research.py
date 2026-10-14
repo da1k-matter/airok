@@ -17,6 +17,7 @@ FEATURE_VERSION = "v2_numeric_cross_section"
 class ModelSpec:
     horizon: int
     target: str = "residual"
+    side: str = "long"
 
 
 def rolling_rank_pct(x: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
@@ -293,6 +294,9 @@ def train_walk_forward(
     asset_rows = rows["asset_idx"]
     x_all = rows["X"]
     target = make_targets(ctx, spec.horizon, spec.target)["decile"]
+    if spec.side == "short":
+        # Inverted grades put the worst future performers at the top of the NDCG-weighted ranking.
+        target = 9.0 - target
     y_all = target[date_rows, asset_rows]
     scores = np.full((t_count, n_assets), np.nan, np.float32)
 

@@ -159,11 +159,33 @@ def _side_weights(volatility: np.ndarray, selected: np.ndarray, mode: str) -> np
     return values / values.sum()
 
 
-def _project_dollar_and_beta(weights: np.ndarray, beta: np.ndarray) -> np.ndarray:
+def alt_index_beta(ctx: dict[str, Any], window: int = 60) -> np.ndarray:
+    """Rolling beta of every asset to the equal-weighted eligible-universe return, known at each close."""
+    if "alt_beta60" not in ctx:
+        returns = np.asarray(ctx["ret1"], np.float64)
+        eligible = np.asarray(ctx["eligible_max"])
+        with np.errstate(invalid="ignore"):
+            index = np.nanmean(np.where(eligible, returns, np.nan), axis=1)
+        frame = pd.DataFrame(returns)
+        market = pd.Series(index)
+        minimum = window // 2
+        cov = frame.mul(market, axis=0).rolling(window, min_periods=minimum).mean() - frame.rolling(
+            window, min_periods=minimum
+        ).mean().mul(market.rolling(window, min_periods=minimum).mean(), axis=0)
+        var = market.rolling(window, min_periods=minimum).var(ddof=0)
+        ctx["alt_beta60"] = np.clip(cov.div(var, axis=0).to_numpy(), -3.0, 5.0)
+    return ctx["alt_beta60"]
+
+
+def _project_dollar_and_beta(
+    weights: np.ndarray, beta: np.ndarray, extra_betas: list[np.ndarray] | None = None
+) -> np.ndarray:
     selected = np.flatnonzero(weights)
     if selected.size < 4:
         return np.zeros_like(weights)
-    matrix = np.vstack([np.ones(selected.size), beta[selected].astype(np.float64)])
+    rows = [np.ones(selected.size), beta[selected].astype(np.float64)]
+    rows += [np.nan_to_num(extra[selected].astype(np.float64)) for extra in extra_betas or []]
+    matrix = np.vstack(rows)
     raw = weights[selected]
     correction = matrix.T @ np.linalg.solve(
         matrix @ matrix.T + np.eye(matrix.shape[0]) * 1e-6,
@@ -208,7 +230,12 @@ def _funding_adjusted(scores: np.ndarray, ctx: dict[str, Any], portfolio: dict[s
     raise ValueError(f"Unknown portfolio.funding_select.mode: {mode}")
 
 
-def build_daily_signal(ctx: dict[str, Any], scores: np.ndarray, portfolio: dict[str, Any]) -> np.ndarray:
+def build_daily_signal(
+    ctx: dict[str, Any],
+    scores: np.ndarray,
+    portfolio: dict[str, Any],
+    short_scores: np.ndarray | None = None,
+) -> np.ndarray:
     """Create close-t signals shifted to execution at open t+1."""
     liq_rank = np.asarray(ctx["liq_rank"])
     eligible = np.asarray(ctx["eligible_max"])
@@ -220,6 +247,8 @@ def build_daily_signal(ctx: dict[str, Any], scores: np.ndarray, portfolio: dict[
     weighting = str(portfolio["weighting"])
     minimum_universe = int(portfolio.get("minimum_universe", 20))
     scores, long_ok, short_ok = _funding_adjusted(scores, ctx, portfolio)
+    alt_strength = float(portfolio.get("alt_beta_neutral", 0.0))
+    alt_beta = alt_index_beta(ctx) if alt_strength > 0 else None
 
     for t in range(t_count - 1):
         valid = (
@@ -230,6 +259,8 @@ def build_daily_signal(ctx: dict[str, Any], scores: np.ndarray, portfolio: dict[
             & (volatility[t] > 1e-5)
             & np.isfinite(beta[t])
         )
+        if short_scores is not None:
+            valid &= np.isfinite(short_scores[t])
         index = np.flatnonzero(valid)
         if index.size < minimum_universe:
             continue
@@ -242,13 +273,39 @@ def build_daily_signal(ctx: dict[str, Any], scores: np.ndarray, portfolio: dict[
         long_pool = ranked if long_ok is None else ranked[long_ok[t, ranked]]
         if short_pool.size < k or long_pool.size < k:
             continue
-        short_index = short_pool[:k]
         long_index = long_pool[-k:]
+        hedge_count = int(portfolio.get("hedge_count", 0))
+        if hedge_count:
+            # Replace model longs with the most liquid eligible names: a low-noise beta hedge for the shorts.
+            long_index = index[np.argsort(liq_rank[t, index], kind="stable")][:hedge_count]
+            short_pool = short_pool[~np.isin(short_pool, long_index)]
+        if short_scores is None:
+            if short_pool.size < k:
+                continue
+            short_index = short_pool[:k]
+        else:
+            # A dedicated short-side model ranks shorts; low score = short. Never short a selected long.
+            by_short = index[np.argsort(short_scores[t, index].astype(np.float64), kind="stable")]
+            by_short = by_short[~np.isin(by_short, long_index)]
+            if short_ok is not None:
+                by_short = by_short[short_ok[t, by_short]]
+            if by_short.size < k:
+                continue
+            short_index = by_short[:k]
         weights = np.zeros(n_assets, np.float64)
         weights[long_index] = 0.5 * _side_weights(volatility[t], long_index, weighting)
         weights[short_index] = -0.5 * _side_weights(volatility[t], short_index, weighting)
         if bool(portfolio.get("dollar_neutral", True)) or bool(portfolio.get("btc_beta_neutral", True)):
-            weights = _project_dollar_and_beta(weights, beta[t])
+            btc_only = _project_dollar_and_beta(weights, beta[t])
+            if alt_beta is None:
+                weights = btc_only
+            else:
+                # Partial neutralization blends the BTC-only and the BTC+alt-index neutral books.
+                blended = (1.0 - alt_strength) * btc_only + alt_strength * _project_dollar_and_beta(
+                    weights, beta[t], [alt_beta[t]]
+                )
+                gross = np.abs(blended).sum()
+                weights = blended / gross if gross > 1e-8 else blended
         signal[t + 1] = weights.astype(np.float32)
     return signal
 
@@ -289,10 +346,40 @@ def overlay_multiplier(ctx: dict[str, Any], overlay: dict[str, Any]) -> np.ndarr
     return multiplier
 
 
-def build_weights(ctx: dict[str, Any], scores: np.ndarray, portfolio: dict[str, Any]) -> np.ndarray:
-    signal = build_daily_signal(ctx, scores, portfolio)
+def vol_target_multiplier(ctx: dict[str, Any], weights: np.ndarray, options: dict[str, Any]) -> np.ndarray:
+    """Scale exposure to an ex-ante portfolio volatility target.
+
+    Weights executed at open t are priced on close-to-close returns of the
+    previous `lookback` days (rows t-lookback .. t-1), all known at that open.
+    """
+    returns = np.nan_to_num(np.asarray(ctx["ret1"], np.float64))
+    lookback = int(options.get("lookback", 60))
+    target = float(options["target_vol"]) / math.sqrt(365.0)
+    low, high = float(options.get("min_scale", 0.5)), float(options.get("max_scale", 1.5))
+    multiplier = np.ones(weights.shape[0], np.float64)
+    for t in range(lookback, weights.shape[0]):
+        if not np.any(weights[t]):
+            continue
+        history = returns[t - lookback : t] @ weights[t].astype(np.float64)
+        sigma = history.std(ddof=1)
+        if sigma > 1e-9:
+            multiplier[t] = min(high, max(low, target / sigma))
+    return multiplier
+
+
+def build_weights(
+    ctx: dict[str, Any],
+    scores: np.ndarray,
+    portfolio: dict[str, Any],
+    short_scores: np.ndarray | None = None,
+) -> np.ndarray:
+    signal = build_daily_signal(ctx, scores, portfolio, short_scores)
     weights = smooth_fixed_window(signal, int(portfolio["smoothing_days"]))
-    multiplier = overlay_multiplier(ctx, portfolio.get("overlay", {}))
+    vol_target = portfolio.get("vol_target") or {}
+    if bool(vol_target.get("enabled", False)):
+        multiplier = vol_target_multiplier(ctx, weights, vol_target)
+    else:
+        multiplier = overlay_multiplier(ctx, portfolio.get("overlay", {}))
     return (weights * multiplier[:, None]).astype(np.float32)
 
 
