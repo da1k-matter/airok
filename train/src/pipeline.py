@@ -35,6 +35,7 @@ from research import (
     rank_model_scores,
     train_walk_forward,
 )
+from series import load_daily_series
 
 LOG = logging.getLogger(__name__)
 
@@ -54,6 +55,18 @@ def model_specs(config: ExperimentConfig) -> list[ModelSpec]:
 
 def uses_funding_features(config: ExperimentConfig) -> bool:
     return bool(config.section("features").get("funding", False))
+
+
+SERIES_FEATURES = {
+    # flag: (directory, file kind, column, snapshot, ctx key)
+    "open_interest": ("data/oi", "oi", "open_interest", True, "oi"),
+    "ls_ratio": ("data/lsratio", "lsratio", "buy_ratio", True, "ls_buy"),
+    "premium": ("data/premium", "premium", "close", False, "premium"),
+}
+
+
+def series_flags(config: ExperimentConfig) -> list[str]:
+    return [flag for flag in SERIES_FEATURES if config.section("features").get(flag, False)]
 
 
 def funding_levels(config: ExperimentConfig) -> bool:
@@ -90,6 +103,7 @@ def feature_cache_dir(config: ExperimentConfig) -> Path:
         f"{data_fingerprint(config.data_dir, allowed_symbols)}_{FEATURE_VERSION}"
         f"_age{data['min_history_days']}_u{data['feature_universe_max']}"
         f"{('_fund' if funding_levels(config) else '_fundrank') if uses_funding_features(config) else ''}"
+        f"{''.join('_' + SERIES_FEATURES[flag][1] for flag in series_flags(config))}"
     )
     return config.cache_dir / f"features_{key}"
 
@@ -140,8 +154,15 @@ def get_context(config: ExperimentConfig, reuse: bool = True) -> dict[str, Any]:
     if uses_funding_features(config):
         directory = config.resolve((config.section("costs").get("funding") or {}).get("directory", "data/funding"))
         funding_rate_day = load_funding_factors(directory, panel["dates"], panel["symbols"], panel["open"])["rate_sum"]
+    series = {}
+    for flag in series_flags(config):
+        directory, kind, column, snapshot, key = SERIES_FEATURES[flag]
+        series[key] = load_daily_series(
+            config.resolve(directory), kind, column, panel["dates"], panel["symbols"], snapshot
+        )
     ctx = build_features(
         panel,
+        series=series,
         min_age=int(data["min_history_days"]),
         max_universe=int(data["feature_universe_max"]),
         funding_rate_day=funding_rate_day,

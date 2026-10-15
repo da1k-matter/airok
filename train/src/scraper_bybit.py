@@ -27,7 +27,7 @@ import json
 import os
 import random
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -504,6 +504,134 @@ async def download_funding(
     return report
 
 
+@dataclass(frozen=True)
+class SeriesSpec:
+    """A daily public market series fetched in fixed request windows (newest first, capped pages)."""
+
+    name: str
+    endpoint: str
+    per_request: int
+    columns: tuple[str, ...]
+    daily_bars: bool
+    params: Callable[[str, int, int], dict[str, Any]]
+    parse: Callable[[Any], tuple[int, list[float]]]
+
+
+SERIES: dict[str, SeriesSpec] = {
+    # Snapshots stamped at 00:00 UTC: the value at 00:00 of day d+1 is known at the close of day d.
+    "oi": SeriesSpec(
+        "oi", "open-interest", 200, ("open_interest",), False,
+        lambda symbol, low, high: {"category": CATEGORY, "symbol": symbol, "intervalTime": "1d",
+                                   "startTime": low, "endTime": high, "limit": 200},
+        lambda item: (int(item["timestamp"]), [float(item["openInterest"])]),
+    ),
+    "lsratio": SeriesSpec(
+        "lsratio", "account-ratio", 500, ("buy_ratio", "sell_ratio"), False,
+        lambda symbol, low, high: {"category": CATEGORY, "symbol": symbol, "period": "1d",
+                                   "startTime": low, "endTime": high, "limit": 500},
+        lambda item: (int(item["timestamp"]), [float(item["buyRatio"]), float(item["sellRatio"])]),
+    ),
+    # Daily premium-index candles (perp vs index); a bar is known at its close.
+    "premium": SeriesSpec(
+        "premium", "premium-index-price-kline", 1000, ("open", "high", "low", "close"), True,
+        lambda symbol, low, high: {"category": CATEGORY, "symbol": symbol, "interval": "D",
+                                   "start": low, "end": high, "limit": 1000},
+        lambda item: (int(item[0]), [float(value) for value in item[1:5]]),
+    ),
+}
+
+
+async def download_series(
+    client: BybitPublicClient,
+    targets: list[tuple[str, Instrument | None]],
+    spec: SeriesSpec,
+    start_ms: int,
+    end_ms: int,
+    output_dir: Path,
+    *,
+    skip_existing: bool,
+    concurrency: int,
+    show_progress: bool,
+) -> PhaseReport:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report = PhaseReport(name=spec.name)
+    requests_before = client.requests
+    started = time.monotonic()
+    # launchTime can be a contract relaunch date with older history behind it, so it does not clip series.
+    plans = [(base, plan_windows(start_ms, end_ms, DAY_MS, spec.per_request)) for base, _ in targets]
+    progress = _Progress(sum(len(windows) for _, windows in plans), spec.name, client, show_progress)
+    progress.symbol_count = len(plans)
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def one(base: str, windows: list[tuple[int, int]]) -> SymbolResult:
+        result = SymbolResult(base=base)
+        path = output_dir / f"{base}_{spec.name}.csv"
+        if skip_existing and path.exists():
+            progress.skip(len(windows))
+            result.note = "exists"
+            progress.symbol_done()
+            return result
+        if not windows:
+            result.note = "listed after range"
+            progress.symbol_done()
+            return result
+        async with semaphore:
+            rows: dict[int, list[float]] = {}
+            planned, completed = len(windows), 0
+
+            async def fetch(low: int, high: int) -> None:
+                nonlocal planned, completed
+                payload = await client.get(spec.endpoint, spec.params(f"{base}{QUOTE}", low, high))
+                completed += 1
+                progress.request_done()
+                page = payload.get("list") or []
+                stamps = []
+                for item in page:
+                    stamp, values = spec.parse(item)
+                    if low <= stamp <= high:
+                        rows[stamp] = values
+                        stamps.append(stamp)
+                if len(page) >= spec.per_request and stamps and min(stamps) > low:
+                    planned += 1
+                    progress.add_requests(1)
+                    await fetch(low, min(stamps) - 1)
+
+            tasks = [asyncio.create_task(fetch(low, high)) for low, high in windows]
+            try:
+                await asyncio.gather(*tasks)
+            except Exception as exc:
+                for task in tasks:
+                    task.cancel()
+                progress.skip(planned - completed)
+                result.error = str(exc)
+                progress.symbol_done(error=True)
+                return result
+
+        if not rows:
+            result.note = f"no {spec.name}"
+            progress.symbol_done()
+            return result
+        stamps = sorted(rows)
+        frame = pd.DataFrame(
+            {
+                "timestamp": _format_timestamps(stamps, daily=spec.daily_bars),
+                **{column: [rows[s][i] for s in stamps] for i, column in enumerate(spec.columns)},
+            }
+        )
+        _write_csv_atomic(frame, path)
+        result.saved = True
+        result.rows = len(stamps)
+        result.first, result.last = frame["timestamp"].iloc[0], frame["timestamp"].iloc[-1]
+        progress.symbol_done()
+        return result
+
+    report.results = list(await asyncio.gather(*(one(*plan) for plan in plans)))
+    progress.close()
+    report.elapsed_s = time.monotonic() - started
+    report.requests = client.requests - requests_before
+    return report
+
+
 def resolve_targets(
     instruments: dict[str, Instrument],
     symbols: list[str] | None,
@@ -597,7 +725,7 @@ async def run(args: argparse.Namespace) -> int:
         }
         reports: list[PhaseReport] = []
 
-        if not args.funding_only:
+        if not (args.funding_only or args.no_candles):
             report = await download_klines(
                 client, targets, args.interval, start_ms, last_bar_ms, args.data_dir,
                 skip_existing=args.skip_existing, concurrency=args.symbol_concurrency, show_progress=show,
@@ -610,6 +738,17 @@ async def run(args: argparse.Namespace) -> int:
                 skip_existing=args.skip_existing, concurrency=args.symbol_concurrency, show_progress=show,
             )
             _write_manifest(args.funding_dir, "_manifest_funding.json", settings, report)
+            reports.append(report)
+        for key in args.series:
+            spec = SERIES[key]
+            # Snapshot series include the 00:00 value after the last day; bar series end at its open.
+            end = start_ms + args.days * DAY_MS - DAY_MS if spec.daily_bars else range_end_ms + 1
+            directory = args.series_root / spec.name
+            report = await download_series(
+                client, targets, spec, start_ms, end, directory,
+                skip_existing=args.skip_existing, concurrency=args.symbol_concurrency, show_progress=show,
+            )
+            _write_manifest(directory, f"_manifest_{spec.name}.json", settings, report)
             reports.append(report)
 
     print()
@@ -634,12 +773,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     selection.add_argument("--symbols-from", type=Path, help="Use the symbols of existing candle files in DIR")
     parser.add_argument("--funding", action="store_true", help="Also download funding-rate history")
     parser.add_argument("--funding-only", action="store_true", help="Download funding history without candles")
+    parser.add_argument("--no-candles", action="store_true", help="Skip candles (download only selected series)")
+    parser.add_argument("--open-interest", dest="series", action="append_const", const="oi",
+                        help="Also download daily open interest")
+    parser.add_argument("--ls-ratio", dest="series", action="append_const", const="lsratio",
+                        help="Also download the daily long/short account ratio")
+    parser.add_argument("--premium", dest="series", action="append_const", const="premium",
+                        help="Also download daily premium-index candles")
+    parser.add_argument("--series-root", type=Path, default=Path("data"), help="Parent directory of series outputs")
     parser.add_argument("--skip-existing", action="store_true", help="Keep files that already exist")
     parser.add_argument("--rps", type=float, default=80.0, help="Target requests per second (Bybit IP cap is 120)")
     parser.add_argument("--connections", type=int, default=64, help="Maximum open HTTP connections")
     parser.add_argument("--symbol-concurrency", type=int, default=48, help="Symbols downloaded at once")
     parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args(argv)
+    args.series = list(dict.fromkeys(args.series or []))
     if args.days < 1:
         parser.error("--days must be positive")
     return args

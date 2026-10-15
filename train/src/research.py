@@ -48,6 +48,7 @@ def build_features(
     max_universe: int = 150,
     funding_rate_day: np.ndarray | None = None,
     funding_levels: bool = True,
+    series: dict[str, np.ndarray] | None = None,
 ) -> dict[str, Any]:
     symbols: list[str] = panel["symbols"]
     o = panel["open"]
@@ -141,10 +142,39 @@ def build_features(
             levels["fund_7_level"] = np.clip(raw["fund_7"], -3.0, 3.0)
             levels["fund_30_level"] = np.clip(raw["fund_30"], -3.0, 3.0)
 
+    positioning: dict[str, np.ndarray] = {}
+    series = series or {}
+    if "oi" in series:
+        log_oi = np.log(np.where(series["oi"] > 0, series["oi"], np.nan))
+        for window in (1, 3, 7, 30):
+            change = np.full_like(log_oi, np.nan)
+            change[window:] = log_oi[window:] - log_oi[:-window]
+            positioning[f"oi_chg_{window}"] = change
+        positioning["oi_to_volume"] = log_oi + logc - dvol20
+        positioning["oi_vs_price_7"] = positioning["oi_chg_7"] - raw["ret_7"]
+    if "ls_buy" in series:
+        buy = series["ls_buy"]
+        positioning["ls_buy"] = buy
+        change = np.full_like(buy, np.nan)
+        change[7:] = buy[7:] - buy[:-7]
+        positioning["ls_buy_chg_7"] = change
+    if "premium" in series:
+        premium = pd.DataFrame(series["premium"])
+        positioning["premium_1"] = series["premium"]
+        positioning["premium_7"] = premium.rolling(7, min_periods=3).mean().to_numpy()
+        positioning["premium_chg_7"] = positioning["premium_1"] - positioning["premium_7"]
+
     features: dict[str, np.ndarray] = {
         f"{name}_xrank": (rolling_rank_pct(values, eligible_max) - 0.5).astype(np.float32)
         for name, values in raw.items()
     }
+    # Positioning data can be missing for an asset-day; a missing rank is the neutral cross-sectional median.
+    features.update(
+        {
+            f"{name}_xrank": np.nan_to_num(rolling_rank_pct(values, eligible_max) - 0.5).astype(np.float32)
+            for name, values in positioning.items()
+        }
+    )
     features.update({name: values.astype(np.float32) for name, values in levels.items()})
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
