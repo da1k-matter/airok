@@ -172,11 +172,41 @@ def _cross_sectional_z(ctx: dict[str, Any], name: str) -> np.ndarray:
     return np.nan_to_num((values - mean) / np.where(std > 1e-12, std, 1.0))
 
 
-def alt_index_beta(ctx: dict[str, Any], window: int = 60) -> np.ndarray:
-    """Rolling beta of every asset to the equal-weighted eligible-universe return, known at each close."""
-    if "alt_beta60" not in ctx:
+def pca_loadings(ctx: dict[str, Any], components: int, window: int = 90) -> list[np.ndarray]:
+    """Loadings on principal components 2..components+1 of trailing eligible returns, known at each close.
+
+    Component 1 is close to the equal-weighted market and is handled by the alt-index beta.
+    """
+    key = f"pca_{components}_{window}"
+    if key not in ctx:
+        returns = np.nan_to_num(np.asarray(ctx["ret1"], np.float64))
+        eligible = np.asarray(ctx["eligible_max"])
+        t_count, n_assets = returns.shape
+        loadings = [np.zeros((t_count, n_assets)) for _ in range(components)]
+        for t in range(window, t_count):
+            members = np.flatnonzero(eligible[t])
+            if members.size <= components + 1:
+                continue
+            block = returns[t - window + 1 : t + 1][:, members]
+            block = block - block.mean(axis=0)
+            _, _, vt = np.linalg.svd(block, full_matrices=False)
+            for k in range(components):
+                loadings[k][t, members] = vt[k + 1] * np.sqrt(members.size)
+        ctx[key] = loadings
+    return ctx[key]
+
+
+def alt_index_beta(ctx: dict[str, Any], window: int = 60, top: int | None = None) -> np.ndarray:
+    """Rolling beta of every asset to an equal-weighted universe return, known at each close.
+
+    The index holds the eligible universe, or only its `top` most liquid names.
+    """
+    key = "alt_beta60" if top is None else f"alt_beta60_top{top}"
+    if key not in ctx:
         returns = np.asarray(ctx["ret1"], np.float64)
         eligible = np.asarray(ctx["eligible_max"])
+        if top is not None:
+            eligible = eligible & (np.asarray(ctx["liq_rank"]) <= top)
         with np.errstate(invalid="ignore"):
             index = np.nanmean(np.where(eligible, returns, np.nan), axis=1)
         frame = pd.DataFrame(returns)
@@ -186,8 +216,8 @@ def alt_index_beta(ctx: dict[str, Any], window: int = 60) -> np.ndarray:
             window, min_periods=minimum
         ).mean().mul(market.rolling(window, min_periods=minimum).mean(), axis=0)
         var = market.rolling(window, min_periods=minimum).var(ddof=0)
-        ctx["alt_beta60"] = np.clip(cov.div(var, axis=0).to_numpy(), -3.0, 5.0)
-    return ctx["alt_beta60"]
+        ctx[key] = np.clip(cov.div(var, axis=0).to_numpy(), -3.0, 5.0)
+    return ctx[key]
 
 
 def _project_dollar_and_beta(
@@ -223,7 +253,7 @@ def _tail_size(portfolio: dict[str, Any], universe_count: int) -> int:
 def trailing_funding(ctx: dict[str, Any], lookback: int) -> np.ndarray:
     """Annualized mean funding rate over the last `lookback` holding days, known at each close."""
     if "funding_rate_day" not in ctx:
-        raise KeyError("portfolio.funding_select needs ctx['funding_rate_day']; see pipeline.attach_funding")
+        raise KeyError("funding-aware portfolio options need ctx['funding_rate_day']; see pipeline.attach_funding")
     daily = pd.DataFrame(np.asarray(ctx["funding_rate_day"], np.float64))
     return (daily.rolling(lookback, min_periods=1).mean().to_numpy() * 365.0).astype(np.float64)
 
@@ -261,10 +291,12 @@ def build_daily_signal(
     minimum_universe = int(portfolio.get("minimum_universe", 20))
     scores, long_ok, short_ok = _funding_adjusted(scores, ctx, portfolio)
     alt_strength = float(portfolio.get("alt_beta_neutral", 0.0))
-    alt_beta = alt_index_beta(ctx) if alt_strength > 0 else None
+    alt_top = portfolio.get("alt_index_top")
+    alt_beta = alt_index_beta(ctx, top=int(alt_top) if alt_top else None) if alt_strength > 0 else None
     # Optional characteristic exposures neutralized in the same blended book (cross-sectional z-scores).
     characteristic_names = list(portfolio.get("neutral_characteristics", []))
     characteristics = [_cross_sectional_z(ctx, name) for name in characteristic_names]
+    characteristics += pca_loadings(ctx, int(portfolio["pca_neutral"])) if portfolio.get("pca_neutral") else []
 
     trade_mask = portfolio.get("_trade_mask")
 
@@ -349,6 +381,33 @@ def smooth_fixed_window(signal: np.ndarray, days: int) -> np.ndarray:
     return output
 
 
+def smooth_with_fast_exit(
+    ctx: dict[str, Any], signal: np.ndarray, days: int, options: dict[str, Any]
+) -> np.ndarray:
+    """Boxcar smoothing in which costly shorts are held for fewer days at the same capital-days.
+
+    A short whose trailing funding (annualized, known at the signal close) is at or below
+    `funding_below` enters with weight days/fast_days and lives fast_days instead of days.
+    Each smoothed book is then made dollar- and BTC-beta-neutral again at its original gross.
+    """
+    fast_days = int(options.get("days", 7))
+    signal_close = np.roll(trailing_funding(ctx, int(options.get("lookback", 7))), 1, axis=0)
+    fast = (signal < 0) & (np.nan_to_num(signal_close, nan=0.0) <= float(options["funding_below"]))
+    slow_part = np.where(fast, 0.0, signal)
+    fast_part = np.where(fast, signal, 0.0) * (days / fast_days)
+    combined = smooth_fixed_window(slow_part, days) + smooth_fixed_window(fast_part, fast_days)
+    beta = np.asarray(ctx["beta60"])
+    output = np.zeros_like(combined)
+    for t in range(combined.shape[0]):
+        gross = np.abs(combined[t]).sum()
+        if gross <= 1e-8 or t == 0:
+            continue
+        # Weights executed at open t were formed at close t-1, with the betas known then.
+        neutral = _project_dollar_and_beta(combined[t].astype(np.float64), np.nan_to_num(beta[t - 1]))
+        output[t] = (neutral * gross).astype(np.float32)
+    return output
+
+
 def smooth_ewma(signal: np.ndarray, halflife: float) -> np.ndarray:
     """Exponentially weighted average of daily signals, normalized like the fixed window."""
     decay = 0.5 ** (1.0 / halflife)
@@ -411,8 +470,11 @@ def build_weights(
 ) -> np.ndarray:
     signal = build_daily_signal(ctx, scores, portfolio, short_scores)
     halflife = portfolio.get("smoothing_halflife")
+    fast = portfolio.get("fast_exit") or {}
     if halflife:
         weights = smooth_ewma(signal, float(halflife))
+    elif fast:
+        weights = smooth_with_fast_exit(ctx, signal, int(portfolio["smoothing_days"]), fast)
     else:
         weights = smooth_fixed_window(signal, int(portfolio["smoothing_days"]))
     vol_target = portfolio.get("vol_target") or {}

@@ -1,0 +1,95 @@
+name: v2f_h21
+backend:
+  name: lightgbm
+  params:
+    objective: lambdarank
+    metric: ndcg
+    label_gain:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    lambdarank_truncation_level: 30
+    n_estimators: 160
+    learning_rate: 0.05
+    num_leaves: 31
+    min_child_samples: 100
+    subsample: 0.85
+    subsample_freq: 1
+    colsample_bytree: 0.8
+    reg_alpha: 0.5
+    reg_lambda: 6.0
+    max_bin: 127
+    n_jobs: 4
+data:
+  directory: data/1d
+  copy_trading_only: false
+  min_history_days: 180
+  feature_universe_max: 150
+cache:
+  directory: .cache
+model:
+  horizon: 21
+training:
+  prediction_start: 2023-08-01
+  train_window_days: 730
+  retrain_every_days: 56
+  train_stride: 3
+  minimum_train_rows: 5000
+  seeds:
+  - 11
+  - 23
+  - 37
+  - 53
+  - 71
+  - 101
+  - 202
+  - 303
+  - 404
+  - 505
+ensemble:
+  method: median_rank
+  renormalize_portfolio_average: false
+portfolio:
+  universe_size: 75
+  tail_count: 6
+  weighting: invvol
+  smoothing_days: 21
+  dollar_neutral: true
+  btc_beta_neutral: true
+  overlay:
+    enabled: true
+    median_lookback: 180
+    median_min_periods: 90
+    median_lag: 1
+    low_vol_multiplier: 1.1
+    high_vol_multiplier: 0.75
+  alt_beta_neutral: 0.5
+  neutral_characteristics:
+  - size
+costs:
+  one_way_bps: 10.0
+  funding:
+    enabled: true
+    directory: data/funding
+execution:
+  initial_equity_usd: 1000.0
+  gross_leverage: 1.0
+  venue: bybit_linear
+  order_type: market
+evaluation:
+  oos_start: 2023-08-05
+  latest_year_start: 2025-10-13
+  periods_per_year: 365
+  fee_stress_bps:
+  - 5
+  - 10
+  - 15
+  - 20
+  - 30

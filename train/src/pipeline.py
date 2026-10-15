@@ -242,7 +242,10 @@ def build_ensemble_weights(
     ctx: dict[str, Any],
     predictions: dict[int, np.ndarray],
 ) -> tuple[np.ndarray, dict[int, np.ndarray]]:
-    if (config.section("portfolio").get("funding_select") or {}).get("mode", "off") != "off":
+    portfolio_options = config.section("portfolio")
+    if (portfolio_options.get("funding_select") or {}).get("mode", "off") != "off" or portfolio_options.get(
+        "fast_exit"
+    ):
         attach_funding(config, ctx)
     eligible = np.asarray(ctx["eligible_max"])
     short_keys = [key for key in predictions if isinstance(key, tuple) and key[0] == "short"]
