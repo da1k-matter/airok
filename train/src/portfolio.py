@@ -266,10 +266,11 @@ def build_daily_signal(
     characteristic_names = list(portfolio.get("neutral_characteristics", []))
     characteristics = [_cross_sectional_z(ctx, name) for name in characteristic_names]
 
+    trade_mask = portfolio.get("_trade_mask")
+
     for t in range(t_count - 1):
         valid = (
             eligible[t]
-            & (liq_rank[t] <= universe_size)
             & np.isfinite(scores[t])
             & np.isfinite(volatility[t])
             & (volatility[t] > 1e-5)
@@ -277,6 +278,14 @@ def build_daily_signal(
         )
         if short_scores is not None:
             valid &= np.isfinite(short_scores[t])
+        if trade_mask is None:
+            valid &= liq_rank[t] <= universe_size
+        else:
+            # Restricted trading: the liquidity-ranked universe is formed after the allowlist filter.
+            candidates = np.flatnonzero(valid & trade_mask)
+            chosen = candidates[np.argsort(liq_rank[t, candidates], kind="stable")][:universe_size]
+            valid = np.zeros(n_assets, bool)
+            valid[chosen] = True
         index = np.flatnonzero(valid)
         if index.size < minimum_universe:
             continue

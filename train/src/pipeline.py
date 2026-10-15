@@ -60,10 +60,27 @@ def funding_levels(config: ExperimentConfig) -> bool:
     return config.section("features").get("funding") != "rank_only"
 
 
+def load_symbol_list(config: ExperimentConfig, path: str) -> frozenset[str]:
+    """Read a frozen symbol list: a JSON file with a `symbols` array of base symbols."""
+    return frozenset(json.loads(config.resolve(path).read_text(encoding="utf-8"))["symbols"])
+
+
 def configured_symbol_allowlist(config: ExperimentConfig) -> frozenset[str] | None:
-    if not bool(config.section("data").get("copy_trading_only", False)):
+    data = config.section("data")
+    if data.get("symbol_allowlist"):
+        return load_symbol_list(config, str(data["symbol_allowlist"]))
+    if not bool(data.get("copy_trading_only", False)):
         return None
     return fetch_copy_trading_base_symbols()
+
+
+def portfolio_section(config: ExperimentConfig, ctx: dict[str, Any]) -> dict[str, Any]:
+    """Portfolio settings with the optional trading allowlist resolved to a per-symbol mask."""
+    portfolio = dict(config.section("portfolio"))
+    if portfolio.get("trade_allowlist"):
+        allowed = load_symbol_list(config, str(portfolio["trade_allowlist"]))
+        portfolio["_trade_mask"] = np.array([symbol in allowed for symbol in ctx["symbols"]], dtype=bool)
+    return portfolio
 
 
 def feature_cache_dir(config: ExperimentConfig) -> Path:
@@ -215,14 +232,14 @@ def build_ensemble_weights(
         weights = build_weights(
             ctx,
             aggregate_seed_ranks(long_ranks, method),
-            config.section("portfolio"),
+            portfolio_section(config, ctx),
             short_scores=aggregate_seed_ranks(short_ranks, method),
         )
         return weights.astype(np.float32), dict(enumerate(long_ranks))
     seed_scores = {seed: rank_model_scores(scores, eligible) for seed, scores in predictions.items()}
     ensemble = config.section("ensemble")
     method = str(ensemble["method"])
-    portfolio = config.section("portfolio")
+    portfolio = portfolio_section(config, ctx)
 
     if method == "portfolio_average":
         portfolios = [build_weights(ctx, score, portfolio) for score in seed_scores.values()]

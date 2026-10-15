@@ -1,4 +1,4 @@
 {
-  "name": "i_size",
-  "config": "research/configs/i_size.yaml"
+  "name": "v2_base_neutral",
+  "config": "research/configs/v2_base_neutral.yaml"
 }

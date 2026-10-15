@@ -1,11 +1,14 @@
 """Research harness: evaluate one configuration variant against the champion.
 
-    python research/harness.py <name> [dotted.key=yaml_value ...] [--base CONFIG] [--holdout]
+    python research/harness.py <name> [dotted.key=yaml_value ...] [--base CONFIG] [--tracks full,copy,strict]
 
 The variant config is written to research/configs/<name>.yaml, so every result
 is reproducible with `python src/cli.py run --config research/configs/<name>.yaml`.
-Daily returns and metrics go to research/results/<name>.{csv,json}. Bybit
-instrument rules come from a frozen snapshot for deterministic execution.
+Every run evaluates the same trained models in several trading tracks: the
+full universe, the current Copy Trading list and the strict August-2026 Copy
+Trading list (frozen JSON lists under .cache/). Daily returns go to
+research/results/<name>[@track].csv, metrics of all tracks to <name>.json.
+Bybit instrument rules come from a frozen snapshot for deterministic execution.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from bybit import BybitInstrumentRule  # noqa: E402
-from config import load_config  # noqa: E402
+from config import ExperimentConfig, load_config  # noqa: E402
 from funding import load_funding_factors  # noqa: E402
 from pipeline import _bybit_rule_arrays, build_ensemble_weights, get_context, train_models  # noqa: E402
 from portfolio import simulate_bybit_market_pnl, simulate_target_weight_pnl, target_weight_funding  # noqa: E402
@@ -152,9 +155,28 @@ def report(daily: pd.DataFrame, holdout: bool) -> dict[str, Any]:
     return out
 
 
-def print_report(name: str, result: dict[str, Any], champion: dict[str, Any] | None, t_stat: float | None) -> None:
+TRACKS = {
+    "full": None,
+    "copy": ".cache/copy_trading_current_20261014.json",
+    "strict": ".cache/copy_trading_strict_20260901.json",
+}
+
+
+def result_file(name: str, track: str, suffix: str) -> Path:
+    stem = name if track == "full" else f"{name}@{track}"
+    return RESEARCH / "results" / f"{stem}.{suffix}"
+
+
+def print_report(
+    name: str,
+    track: str,
+    result: dict[str, Any],
+    champion: dict[str, Any] | None,
+    t_stats: dict[str, float] | None,
+) -> None:
     head = f"{'period':8s} {'Sharpe':>7s} {'dSh':>6s} {'Sortino':>7s} {'CAGR':>7s} {'MaxDD':>6s} {'Calmar':>6s} {'+mon':>5s} {'+day':>5s} {'worstM':>7s} {'fund/y':>7s} {'TO/y':>5s} {'noFund':>6s} {'exec':>5s}"
-    print(f"\n== {name}" + (f"   paired t vs champion (DEV): {t_stat:+.2f}" if t_stat is not None else ""))
+    paired = "" if not t_stats else "   paired t vs champion: " + " ".join(f"{k} {v:+.2f}" for k, v in t_stats.items())
+    print(f"\n== {name} [{track}]{paired}")
     print(head)
     for label, m in result.items():
         delta = m["sharpe"] - champion[label]["sharpe"] if champion and label in champion else float("nan")
@@ -165,12 +187,19 @@ def print_report(name: str, result: dict[str, Any], champion: dict[str, Any] | N
         )
 
 
+def track_config(config: ExperimentConfig, track: str) -> ExperimentConfig:
+    raw = deepcopy(config.raw)
+    if TRACKS[track] is not None:
+        raw["portfolio"]["trade_allowlist"] = TRACKS[track]
+    return ExperimentConfig(raw=raw, path=config.path, root=config.root)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("name")
     parser.add_argument("overrides", nargs="*", help="dotted.key=yaml_value")
     parser.add_argument("--base", type=Path, default=None, help="Base config; default is the champion config")
-    parser.add_argument("--holdout", action="store_true", help="Also report the untouched HOLDOUT period")
+    parser.add_argument("--tracks", default="full,copy,strict", help="Comma-separated subset of: " + ",".join(TRACKS))
     parser.add_argument("--promote", action="store_true", help="Make this variant the champion")
     args = parser.parse_args()
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s | %(message)s", datefmt="%H:%M:%S")
@@ -190,29 +219,35 @@ def main() -> None:
     config = load_config(config_path)
     ctx = get_context(config)
     predictions = train_models(config, ctx)
-    weights, _ = build_ensemble_weights(config, ctx, predictions)
-    daily = simulate(config, ctx, weights, HOLDOUT[1] if args.holdout else DEV[1])
-
-    results = RESEARCH / "results"
-    results.mkdir(parents=True, exist_ok=True)
-    daily.to_csv(results / f"{args.name}.csv")
-    result = report(daily, args.holdout)
-    t_stat = None
-    champion_metrics = None
-    if champion and champion["name"] != args.name:
-        champion_daily = pd.read_csv(results / f"{champion['name']}.csv", index_col=0, parse_dates=True)
-        dev = slice(*DEV)
-        t_stat = paired_t(daily.loc[dev, "ideal"], champion_daily.loc[dev, "ideal"])
-        champion_metrics = json.loads((results / f"{champion['name']}.json").read_text())["metrics"]
-    (results / f"{args.name}.json").write_text(
-        json.dumps(
-            {"name": args.name, "config": str(config_path.relative_to(ROOT)), "overrides": args.overrides,
-             "paired_t_vs_champion": t_stat, "champion": champion["name"] if champion else None,
-             "metrics": result},
-            indent=2,
-        )
-    )
-    print_report(args.name, result, champion_metrics, t_stat)
+    (RESEARCH / "results").mkdir(parents=True, exist_ok=True)
+    summary: dict[str, Any] = {
+        "name": args.name,
+        "config": str(config_path.relative_to(ROOT)),
+        "overrides": args.overrides,
+        "champion": champion["name"] if champion else None,
+        "metrics": {},
+        "paired_t_vs_champion": {},
+    }
+    for track in args.tracks.split(","):
+        variant = track_config(config, track)
+        weights, _ = build_ensemble_weights(variant, ctx, predictions)
+        daily = simulate(variant, ctx, weights, HOLDOUT[1])
+        daily.to_csv(result_file(args.name, track, "csv"))
+        result = report(daily, holdout=True)
+        summary["metrics"][track] = result
+        t_stats = None
+        champion_metrics = None
+        if champion and champion["name"] != args.name and result_file(champion["name"], track, "csv").exists():
+            reference = pd.read_csv(result_file(champion["name"], track, "csv"), index_col=0, parse_dates=True)
+            t_stats = {
+                label: paired_t(daily.loc[start:end, "ideal"], reference.loc[start:end, "ideal"])
+                for label, (start, end) in (("DEV", DEV), ("HOLDOUT", HOLDOUT))
+            }
+            summary["paired_t_vs_champion"][track] = t_stats
+            champion_metrics = json.loads((RESEARCH / "results" / f"{champion['name']}.json").read_text())["metrics"]
+            champion_metrics = champion_metrics.get(track) if "full" in champion_metrics else None
+        print_report(args.name, track, result, champion_metrics, t_stats)
+    (RESEARCH / "results" / f"{args.name}.json").write_text(json.dumps(summary, indent=2))
     if args.promote or champion is None:
         CHAMPION_FILE.write_text(json.dumps({"name": args.name, "config": str(config_path.relative_to(ROOT))}, indent=2))
         print(f"\nchampion -> {args.name}")
