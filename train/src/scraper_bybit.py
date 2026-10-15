@@ -53,6 +53,8 @@ INTERVAL_MINUTES = {
 }
 # 10006: too many visits; 10018: IP rate limit exceeded.
 RATE_LIMIT_CODES = frozenset({10006, 10018})
+# 10016: transient service error ("svc error: Get kline failed").
+TRANSIENT_CODES = frozenset({10016})
 
 
 class BybitError(RuntimeError):
@@ -160,6 +162,10 @@ class BybitPublicClient:
             if code in RATE_LIMIT_CODES:
                 self.limiter.on_rate_limit()
                 last_error = BybitError(f"retCode={code} {payload.get('retMsg')}")
+                continue
+            if code in TRANSIENT_CODES:
+                last_error = BybitError(f"retCode={code} {payload.get('retMsg')}")
+                await asyncio.sleep(0.5)
                 continue
             raise BybitError(f"{endpoint} {query}: retCode={code} {payload.get('retMsg')}")
         raise BybitError(f"{endpoint} {query}: failed after {self.retries} attempts: {last_error}")
