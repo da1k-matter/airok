@@ -106,9 +106,9 @@ same recipe (here the champion):
 
 ```bash
 python src/export_bundle.py --config configs/lightgbm_h7_champion.yaml \
-  --bundle ../live/models/parity_champion_warmup_20260505 --prediction-date 2026-05-05
+  --bundle research/parity_bundles/parity_champion_warmup_20260505 --prediction-date 2026-05-05
 python src/export_bundle.py --config configs/lightgbm_h7_champion.yaml \
-  --bundle ../live/models/parity_champion_block_20260630 --prediction-date 2026-06-30
+  --bundle research/parity_bundles/parity_champion_block_20260630 --prediction-date 2026-06-30
 python src/cli.py run --config configs/lightgbm_h7_champion.yaml --no-funding
 ```
 
@@ -119,8 +119,8 @@ from `live/` and open `http://127.0.0.1:8789`:
 ```bash
 cargo run --release -p airok-paper -- --config config/paper.toml \
   --replay-start 2026-06-30 --replay-end 2026-08-24 \
-  --replay-bundle models/parity_champion_block_20260630 \
-  --warmup-bundle models/parity_champion_warmup_20260505 \
+  --replay-bundle ../train/research/parity_bundles/parity_champion_block_20260630 \
+  --warmup-bundle ../train/research/parity_bundles/parity_champion_warmup_20260505 \
   --reference ../train/outputs/runs/<run>/ideal_reference.csv
 ```
 

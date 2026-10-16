@@ -53,18 +53,16 @@ additionally holds `without_funding` metrics from the same predictions and a
 `funding` attribution block (annualized total, long and short sides, coverage).
 `daily.csv` gains `funding_return` and `net_return_without_funding`.
 
-`configs/lightgbm_h7_1000d.yaml` is the production recipe shifted to start
-predictions in 2025 so it runs on a 1000-day panel.
+`configs/lightgbm_h7.yaml` is the original five-seed LightGBM LambdaRank ensemble with median-rank aggregation.
 
-`configs/lightgbm_h7.yaml` is the production candidate: a five-seed LightGBM LambdaRank ensemble with median-rank aggregation.
-
-`configs/lightgbm_h7_copytrading.yaml` runs the same recipe on the current
-Bybit Copy Trading universe. At process start it requests Bybit linear
-instrument metadata and retains only `Trading` USDT `LinearPerpetual`
-contracts whose `copyTrading` value is `both`. The exact data-file universe is
-saved as `training_universe.json` in the run output alongside the complete API
-rule snapshot. Run it with the same command, substituting the copy-trading
-config path.
+`configs/lightgbm_h7_champion.yaml` is the live recipe (research champion
+`v2_base_neutral`): the same model with 10 seeds plus 0.5 alt-index and size
+neutralization in the portfolio. Export the live bundle with
+`python src/export_bundle.py --config configs/lightgbm_h7_champion.yaml --bundle ../live/models/<name>`.
+Models are trained on the full universe; to trade only Copy Trading contracts,
+enable `bybit.copy_trading_only` in the live service instead of training on
+that subset. Research variants and their logs live in the untracked `research/`
+directory.
 
 ## Local artifacts
 
