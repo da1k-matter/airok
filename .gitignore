@@ -42,3 +42,6 @@ train/outputs/**/*.html
 
 # Generated research reports at the repository root
 /*.html
+
+# Local quant research workspace (harness, configs, results, logs)
+train/research/
