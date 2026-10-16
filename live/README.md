@@ -28,17 +28,45 @@ Open `http://127.0.0.1:8789`. Readiness is confirmed by `GET /health` and the de
 
 The default runtime configuration reads the shared historical candle directory at `../train/data/1d` for bootstrap only. It writes no research artifacts there. Change `[data].directory` if the deployed service maintains its own market-history store.
 
+### Strategy
+
+The default bundle `models/lightgbm_h7_champion_20261013` is the research champion
+`v2_base_neutral` (`train/configs/lightgbm_h7_champion.yaml`): the same LightGBM h7 recipe with
+10 seeds, plus portfolio neutralization configured in `[strategy]`:
+
+- `alt_beta_neutral = 0.5` blends the dollar/BTC-beta neutral book 50/50 with a book that is
+  also neutral to the 60-day beta against the equal-weighted eligible-universe return;
+- `size_neutral = true` additionally neutralizes the cross-sectional z-score of 20-day log
+  dollar volume in that second book.
+
+Seed ranks are aggregated with float32 rounding exactly as numpy does, so that equal ranks tie
+and are ordered by column like numpy's stable sort.
+
+### Funding
+
+Open positions pay and receive funding as on Bybit. For every settlement of a held contract
+the service reads the settled rate from `/v5/market/funding/history` and the mark price at the
+settlement time from the one-minute `/v5/market/mark-price-kline`, then books
+`-quantity × mark price × rate` into cash: longs pay a positive rate and shorts receive it.
+The quantity is the one held at the settlement timestamp (a fill at exactly that time does not
+count), taken from a persisted quantity history, so a late or retried check charges the same
+amount. Settlements are polled every minute and once more right before each daily rebalance.
+Every charge is stored in the `funding_events` table and served at `GET /api/funding`; the
+dashboard shows cumulative funding and funding per open position. Ledgers created before this
+feature start accruing funding for their open positions at the next launch.
+
 ### Copy Trading execution universe
 
 Set `bybit.copy_trading_only = true` to query Bybit's public instrument API at
-each daily refresh and permit new targets only when the API reports all of:
+each daily refresh and trade only contracts the API reports with all of:
 `status=Trading`, `contractType=LinearPerpetual`, `quoteCoin=USDT`,
 `settleCoin=USDT`, and `copyTrading=both`. The full immutable model universe
 is still subscribed and used for scoring; filtering it would violate a bundle's
-feature contract. Existing positions remain reducible even if a contract later
-loses Copy Trading availability. Exporting a bundle from the corresponding
-`train/configs/lightgbm_h7_copytrading.yaml` recipe produces an immutable
-model universe containing only these eligible symbols.
+feature contract. As in the research track B, the 75-name liquidity universe and the long and
+short tails are then formed among the allowed contracts only, so the book stays neutral.
+Existing positions remain reducible even if a contract later loses Copy Trading availability.
+Keep a bundle trained on the full universe: research showed that training only on Copy Trading
+contracts is worse when trading them.
 
 ### Performance history
 
@@ -72,24 +100,31 @@ cargo run --release -p airok-paper -- --config /path/to/replay.toml --ledger-rep
 
 This short, isolated mode verifies Rust against an existing Python backtest over one complete 56-day walk-forward block. It uses local OHLCV only: no Bybit connection, order book, slippage, or live-paper ledger state. The previous fold is used only for the 21-day smoothing warm-up.
 
-First export the two required Python folds from `train/`:
+First export the two required Python folds and a funding-free Python reference from `train/`.
+The replay uses the `[strategy]` rules of the given config, so the reference must come from the
+same recipe (here the champion):
 
 ```bash
-python src/export_bundle.py --config configs/lightgbm_h7.yaml --data data/1d \
-  --bundle ../live/models/parity_warmup_20260310 --prediction-date 2026-03-10
-python src/export_bundle.py --config configs/lightgbm_h7.yaml --data data/1d \
-  --bundle ../live/models/parity_block_20260505 --prediction-date 2026-05-05
+python src/export_bundle.py --config configs/lightgbm_h7_champion.yaml \
+  --bundle ../live/models/parity_champion_warmup_20260505 --prediction-date 2026-05-05
+python src/export_bundle.py --config configs/lightgbm_h7_champion.yaml \
+  --bundle ../live/models/parity_champion_block_20260630 --prediction-date 2026-06-30
+python src/cli.py run --config configs/lightgbm_h7_champion.yaml --no-funding
 ```
 
-Then run this from `live/` and open `http://127.0.0.1:8789`:
+The replay compares target-weight returns, so convert the run's `ideal_net_return` and
+`ideal_turnover` columns into `date,net_return,turnover` (`ideal_reference.csv`). Then run this
+from `live/` and open `http://127.0.0.1:8789`:
 
 ```bash
 cargo run --release -p airok-paper -- --config config/paper.toml \
-  --replay-start 2026-05-05 --replay-end 2026-06-29 \
-  --replay-bundle models/parity_block_20260505 \
-  --warmup-bundle models/parity_warmup_20260310 \
-  --reference ../train/outputs/runs/20260805_075042_lightgbm_h7_multiseed/daily.csv
+  --replay-start 2026-06-30 --replay-end 2026-08-24 \
+  --replay-bundle models/parity_champion_block_20260630 \
+  --warmup-bundle models/parity_champion_warmup_20260505 \
+  --reference ../train/outputs/runs/<run>/ideal_reference.csv
 ```
+
+On 2026-10-16 this block matched Python within 3.6e-9 (daily return) and 3.8e-8 (turnover).
 
 The command exits before serving if its maximum daily return or turnover difference exceeds `1e-6`. On success, the dashboard is explicitly labelled `HISTORICAL REPLAY` and `state/paper/historical_replay.csv` contains the 56 daily values.
 

@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
 pub type Usd = f64;
@@ -160,6 +161,9 @@ pub struct Position {
     pub realized_pnl: Usd,
     #[serde(default)]
     pub entry_fees: Usd,
+    /// Funding received (positive) or paid (negative) while this position was open.
+    #[serde(default)]
+    pub funding_pnl: Usd,
     pub opened_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -203,6 +207,47 @@ pub struct PaperState {
     #[serde(default)]
     pub realized_pnl: Usd,
     pub positions: Vec<Position>,
+    /// Absent in ledgers written before funding was simulated.
+    #[serde(default)]
+    pub funding: Option<FundingState>,
+}
+
+/// A signed position quantity that took effect at `at` (after a fill).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct QuantityChange {
+    pub at: DateTime<Utc>,
+    pub quantity: Quantity,
+}
+
+/// Funding bookkeeping that survives restarts.
+///
+/// `cursors[symbol]` is the time through which every settlement of that symbol is accounted;
+/// `quantity_log` keeps the quantity history needed to price settlements after that time.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FundingState {
+    pub funding_pnl: Usd,
+    pub cursors: BTreeMap<String, DateTime<Utc>>,
+    pub quantity_log: BTreeMap<String, Vec<QuantityChange>>,
+}
+
+/// One exchange funding settlement: the rate and the mark price at the settlement time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FundingSettlement {
+    pub symbol: String,
+    pub settled_at: DateTime<Utc>,
+    pub funding_rate: f64,
+    pub mark_price: Price,
+}
+
+/// Funding charged to the paper account: `amount = -quantity * mark_price * funding_rate`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FundingEvent {
+    pub symbol: String,
+    pub settled_at: DateTime<Utc>,
+    pub quantity: Quantity,
+    pub mark_price: Price,
+    pub funding_rate: f64,
+    pub amount: Usd,
 }
 
 #[derive(Debug, thiserror::Error)]
