@@ -9,7 +9,10 @@ use chrono::{DateTime, NaiveDate, Utc};
 use futures_util::{StreamExt, stream};
 use parking_lot::{Mutex, RwLock};
 use rt_bybit::{BybitPublicClient, base_symbol, bybit_linear_symbol};
-use rt_domain::{AccountSnapshot, Candle, ExecutionReport, InstrumentRules, OrderBookSnapshot};
+use rt_domain::{
+    AccountSnapshot, Candle, ExecutionReport, FundingEvent, FundingSettlement, InstrumentRules,
+    OrderBookSnapshot,
+};
 use rt_engine::{PaperConfig, PaperEngine, RiskLimits};
 use rt_execution::SnapshotExecutionConfig;
 use rt_ledger::{
@@ -18,10 +21,11 @@ use rt_ledger::{
 };
 use rt_model::{BundleMetadata, LightGbmLibrary, NativeBooster, inspect_bundle};
 use rt_panel::{
-    FeaturePanel, MarketPanel, build_features, load_daily_csv_panel, merge_confirmed_daily_candles,
+    FeaturePanel, MarketPanel, alt_index_beta, build_features, load_daily_csv_panel,
+    merge_confirmed_daily_candles, size_exposure,
 };
 use rt_strategy::{
-    OverlayRules, PortfolioRules, apply_volatility_overlay, build_daily_weights,
+    FactorExposures, OverlayRules, PortfolioRules, apply_volatility_overlay, build_daily_weights,
     median_rank_ensemble, smooth_fixed_window,
 };
 use serde::{Deserialize, Serialize};
@@ -37,6 +41,11 @@ use tower_http::trace::TraceLayer;
 
 const PAPER_SESSION_ID: &str = "airok-paper-v1";
 const DASHBOARD_CACHE_POINTS: usize = 5_000;
+/// How often open (and just-closed) positions are checked for new funding settlements.
+const FUNDING_POLL_SECONDS: u64 = 60;
+/// A settlement may be published late; symbols (also recently closed ones) are re-checked over
+/// this window before it is considered complete, like quasar's FUNDING_LATE_WINDOW_MS.
+const FUNDING_PUBLICATION_LAG_MINUTES: i64 = 120;
 
 #[derive(Debug, Clone, Deserialize)]
 struct RuntimeConfig {
@@ -46,6 +55,44 @@ struct RuntimeConfig {
     server: ServerConfig,
     storage: StorageConfig,
     bybit: BybitConfig,
+    #[serde(default)]
+    strategy: StrategyConfig,
+}
+
+/// Portfolio factor neutralization; the defaults are the research champion (`v2_base_neutral`).
+#[derive(Debug, Clone, Deserialize)]
+struct StrategyConfig {
+    #[serde(default = "default_alt_beta_neutral")]
+    alt_beta_neutral: f64,
+    #[serde(default = "default_size_neutral")]
+    size_neutral: bool,
+}
+
+impl Default for StrategyConfig {
+    fn default() -> Self {
+        Self {
+            alt_beta_neutral: default_alt_beta_neutral(),
+            size_neutral: default_size_neutral(),
+        }
+    }
+}
+
+fn default_alt_beta_neutral() -> f64 {
+    PortfolioRules::default().alt_beta_neutral
+}
+
+fn default_size_neutral() -> bool {
+    PortfolioRules::default().size_neutral
+}
+
+impl StrategyConfig {
+    fn portfolio_rules(&self) -> PortfolioRules {
+        PortfolioRules {
+            alt_beta_neutral: self.alt_beta_neutral,
+            size_neutral: self.size_neutral,
+            ..PortfolioRules::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -151,7 +198,9 @@ impl MinuteReturnState {
         }
         for window in history.windows(2).take(history.len().saturating_sub(2)) {
             if window[0].equity > 0.0 {
-                state.completed.push(window[1].equity / window[0].equity - 1.0);
+                state
+                    .completed
+                    .push(window[1].equity / window[0].equity - 1.0);
             }
         }
         let previous = &history[history.len() - 2];
@@ -269,8 +318,8 @@ impl DashboardCache {
                 });
             }
             Some(minute) if minute == snapshot_minute => {
-                let previous_equity = (self.history.len() >= 2)
-                    .then(|| self.history[self.history.len() - 2].equity);
+                let previous_equity =
+                    (self.history.len() >= 2).then(|| self.history[self.history.len() - 2].equity);
                 let point = self
                     .history
                     .last_mut()
@@ -359,14 +408,10 @@ impl DashboardCache {
             .timestamp()
             .div_euclid(60);
         let latest_bucket = (latest_minute - first_minute).div_euclid(bucket_minutes.max(1));
-        let previous_bucket = previous_minute
-            .map(|minute| (minute - first_minute).div_euclid(bucket_minutes.max(1)));
-        let aggregate = aggregate_history_bucket(
-            &self.history,
-            first_minute,
-            bucket_minutes,
-            latest_bucket,
-        );
+        let previous_bucket =
+            previous_minute.map(|minute| (minute - first_minute).div_euclid(bucket_minutes.max(1)));
+        let aggregate =
+            aggregate_history_bucket(&self.history, first_minute, bucket_minutes, latest_bucket);
         match previous_bucket {
             Some(bucket) if bucket == latest_bucket => {
                 if let Some(last) = self.curve.points.last_mut() {
@@ -479,6 +524,8 @@ struct SessionView {
     detail: String,
     model: ModelView,
     account: AccountSnapshot,
+    /// Cumulative funding received (positive) or paid (negative); already included in cash.
+    funding_pnl: f64,
     session_start_equity_usd: f64,
     last_decision_date: Option<String>,
     last_error: Option<String>,
@@ -493,6 +540,7 @@ struct PositionView {
     entry_price: f64,
     mark_price: f64,
     unrealized_pnl: f64,
+    funding_pnl: f64,
     opened_at: chrono::DateTime<Utc>,
 }
 
@@ -522,7 +570,7 @@ async fn main() -> Result<()> {
     let bootstrap_previous_day =
         should_bootstrap_previous_day(restored_state.is_none(), no_bootstrap);
     let engine = if let Some(state) = restored_state {
-        PaperEngine::restore(paper_config, state)?
+        PaperEngine::restore(paper_config, state, Utc::now())?
     } else {
         if ledger_replay {
             bail!("ledger replay requires an existing paper state");
@@ -583,6 +631,7 @@ async fn main() -> Result<()> {
             config.clone(),
             bootstrap_previous_day,
         ));
+        tokio::spawn(run_funding_loop(state.clone(), config.clone()));
         tokio::spawn(run_open_position_mark_loop(state.clone(), config));
     }
     let app = Router::new()
@@ -591,6 +640,7 @@ async fn main() -> Result<()> {
         .route("/api/session", get(session))
         .route("/api/positions", get(positions))
         .route("/api/executions", get(executions))
+        .route("/api/funding", get(funding_events))
         .route("/api/metrics", get(metrics))
         .route("/api/equity", get(equity))
         .route("/assets/styles.css", get(styles))
@@ -916,6 +966,95 @@ async fn run_open_position_mark_loop(state: AppState, config: RuntimeConfig) {
     }
 }
 
+async fn run_funding_loop(state: AppState, config: RuntimeConfig) {
+    let client = BybitPublicClient::default();
+    loop {
+        if let Err(error) = settle_funding(&state, &client, config.bybit.rest_parallelism).await {
+            eprintln!("funding settlement failed: {error:#}");
+        }
+        tokio::time::sleep(Duration::from_secs(FUNDING_POLL_SECONDS)).await;
+    }
+}
+
+/// Charge every exchange funding settlement not yet accounted, exactly as Bybit does:
+/// `-quantity * mark price at the settlement * funding rate`, using the quantity held then.
+async fn settle_funding(
+    state: &AppState,
+    client: &BybitPublicClient,
+    parallelism: usize,
+) -> Result<Vec<FundingEvent>> {
+    let now = Utc::now();
+    let cursors = state.engine.lock().funding_cursors();
+    if cursors.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fetched = stream::iter(cursors)
+        .map(|(symbol, cursor)| {
+            let client = client.clone();
+            async move {
+                let settlements = async {
+                    let mut settlements = Vec::new();
+                    for (settled_at, funding_rate) in
+                        client.funding_history(&symbol, cursor, now).await?
+                    {
+                        settlements.push(FundingSettlement {
+                            symbol: symbol.clone(),
+                            settled_at,
+                            funding_rate,
+                            mark_price: client.mark_price_at(&symbol, settled_at).await?,
+                        });
+                    }
+                    anyhow::Ok(settlements)
+                }
+                .await;
+                (symbol, settlements)
+            }
+        })
+        .buffer_unordered(parallelism.max(1))
+        .collect::<Vec<_>>()
+        .await;
+    let checked_through = now - chrono::Duration::minutes(FUNDING_PUBLICATION_LAG_MINUTES);
+    let mut events = Vec::new();
+    let (snapshot, persisted) = {
+        let mut engine = state.engine.lock();
+        for (symbol, settlements) in fetched {
+            match settlements {
+                Ok(settlements) => {
+                    events.extend(
+                        settlements
+                            .iter()
+                            .filter_map(|item| engine.apply_funding(item)),
+                    );
+                    engine.complete_funding_through(&symbol, checked_through);
+                }
+                Err(error) => eprintln!("funding for {symbol} is unavailable: {error:#}"),
+            }
+        }
+        (engine.snapshot(now), engine.persistent_state())
+    };
+    let ledger = Arc::clone(&state.ledger);
+    let recorded = events.clone();
+    let charged = !events.is_empty();
+    let dashboard_snapshot = snapshot.clone();
+    tokio::task::spawn_blocking(move || {
+        let ledger = ledger.lock();
+        for event in &recorded {
+            ledger.record_funding_event(PAPER_SESSION_ID, event)?;
+        }
+        if charged {
+            ledger.record_equity_point_and_state(&snapshot, &persisted, now)
+        } else {
+            ledger.save_engine_state(&persisted, now)
+        }
+    })
+    .await
+    .context("join funding ledger write")??;
+    if charged {
+        apply_dashboard_snapshot(state, &dashboard_snapshot)?;
+    }
+    Ok(events)
+}
+
 fn open_position_symbols(state: &AppState) -> Vec<String> {
     state.engine.lock().position_symbols()
 }
@@ -1238,12 +1377,26 @@ async fn decide_for_latest(
         "calculating",
         "Rebuilding features, ranks, smoothing state, and paper targets.",
     );
-    let target = {
-        let mut scorer = NativeScorer::load(&bundle)?;
-        scorer.target_weights(&market)?
-    };
     let client = BybitPublicClient::default();
+    // Book the settlement at this close against the positions that were held through it,
+    // so that it lands in the period that earned it.
+    if let Err(error) = settle_funding(&state, &client, config.bybit.rest_parallelism).await {
+        eprintln!("pre-rebalance funding settlement failed: {error:#}");
+    }
     refresh_instrument_rules(&state, &client).await?;
+    let trade_mask = config.bybit.copy_trading_only.then(|| {
+        market
+            .symbols
+            .iter()
+            .map(|base| {
+                is_execution_eligible(&state.instrument_rules, &bybit_linear_symbol(base), true)
+            })
+            .collect::<Vec<_>>()
+    });
+    let target = {
+        let mut scorer = NativeScorer::load(&bundle, config.strategy.portfolio_rules())?;
+        scorer.target_weights(&market, trade_mask.as_deref())?
+    };
     let equity = state.engine.lock().snapshot(Utc::now()).equity;
     let mut desired = BTreeMap::<String, f64>::new();
     for (base, weight) in market.symbols.iter().zip(target) {
@@ -1446,7 +1599,8 @@ async fn run_historical_replay(
     if market.symbols != bundle.universe.symbols {
         bail!("local data universe differs from the replay model contract");
     }
-    let panel = build_features(market, 180, 150)?;
+    let rules = config.strategy.portfolio_rules();
+    let panel = ScoringPanel::new(build_features(market, 180, 150)?, &rules);
     let start = panel
         .market
         .dates
@@ -1467,8 +1621,8 @@ async fn run_historical_replay(
     if start < 22 || end >= panel.market.dates.len().saturating_sub(1) {
         bail!("replay needs 21 preceding decision days and one following market open");
     }
-    let mut scorer = NativeScorer::load(&bundle)?;
-    let mut warmup_scorer = NativeScorer::load(&warmup_bundle)?;
+    let mut scorer = NativeScorer::load(&bundle, rules.clone())?;
+    let mut warmup_scorer = NativeScorer::load(&warmup_bundle, rules)?;
     let mut prior_signals = Vec::with_capacity(21);
     for decision_row in start - 22..start - 1 {
         let source = if panel.market.dates[decision_row] < replay.start {
@@ -1476,7 +1630,7 @@ async fn run_historical_replay(
         } else {
             &mut scorer
         };
-        prior_signals.push(source.raw_weights(&panel, decision_row)?);
+        prior_signals.push(source.raw_weights(&panel, decision_row, None)?);
     }
     let mut prior = smooth_fixed_window(&prior_signals, 21)?;
     let prior_volatility = panel.btc_vol20[..start]
@@ -1505,7 +1659,7 @@ async fn run_historical_replay(
             } else {
                 &mut scorer
             };
-            signals.push(source.raw_weights(&panel, decision_row)?);
+            signals.push(source.raw_weights(&panel, decision_row, None)?);
         }
         let mut weights = smooth_fixed_window(&signals, 21)?;
         let volatility = panel.btc_vol20[..=row]
@@ -1648,13 +1802,35 @@ fn compare_reference(reference: &PathBuf, output: &PathBuf) -> Result<(f64, f64)
     Ok((max_return_diff, max_turnover_diff))
 }
 
+/// A feature panel plus the factor exposures the portfolio rules need at every decision row.
+struct ScoringPanel {
+    panel: FeaturePanel,
+    alt_beta: Option<Vec<f64>>,
+}
+
+impl ScoringPanel {
+    fn new(panel: FeaturePanel, rules: &PortfolioRules) -> Self {
+        let alt_beta = (rules.alt_beta_neutral > 0.0).then(|| alt_index_beta(&panel, 60));
+        Self { panel, alt_beta }
+    }
+}
+
+impl std::ops::Deref for ScoringPanel {
+    type Target = FeaturePanel;
+
+    fn deref(&self) -> &FeaturePanel {
+        &self.panel
+    }
+}
+
 struct NativeScorer {
     _library: LightGbmLibrary,
     boosters: Vec<NativeBooster>,
+    rules: PortfolioRules,
 }
 
 impl NativeScorer {
-    fn load(bundle: &BundleMetadata) -> Result<Self> {
+    fn load(bundle: &BundleMetadata, rules: PortfolioRules) -> Result<Self> {
         let library = LightGbmLibrary::linked();
         let boosters = bundle
             .manifest
@@ -1665,23 +1841,29 @@ impl NativeScorer {
         Ok(Self {
             _library: library,
             boosters,
+            rules,
         })
     }
 
-    fn target_weights(&mut self, market: &MarketPanel) -> Result<Vec<f64>> {
-        let panel = build_features(market.clone(), 180, 150)?;
+    fn target_weights(
+        &mut self,
+        market: &MarketPanel,
+        trade_mask: Option<&[bool]>,
+    ) -> Result<Vec<f64>> {
+        let panel = ScoringPanel::new(build_features(market.clone(), 180, 150)?, &self.rules);
         let final_row = panel
             .market
             .dates
             .len()
             .checked_sub(1)
             .context("empty feature panel")?;
-        let first_row = final_row.saturating_sub(20);
+        let days = self.rules.smoothing_days;
+        let first_row = final_row.saturating_sub(days - 1);
         let mut signals = Vec::new();
         for row in first_row..=final_row {
-            signals.push(self.raw_weights(&panel, row)?);
+            signals.push(self.raw_weights(&panel, row, trade_mask)?);
         }
-        let mut weights = smooth_fixed_window(&signals, 21)?;
+        let mut weights = smooth_fixed_window(&signals, days)?;
         let volatility = panel.btc_vol20[..=final_row]
             .iter()
             .map(|value| f64::from(*value))
@@ -1690,7 +1872,12 @@ impl NativeScorer {
         Ok(weights)
     }
 
-    fn raw_weights(&mut self, panel: &FeaturePanel, row: usize) -> Result<Vec<f64>> {
+    fn raw_weights(
+        &mut self,
+        panel: &ScoringPanel,
+        row: usize,
+        trade_mask: Option<&[bool]>,
+    ) -> Result<Vec<f64>> {
         let width = panel.market.symbols.len();
         let mut matrix = Vec::new();
         let mut columns = Vec::new();
@@ -1714,28 +1901,30 @@ impl NativeScorer {
             }
         }
         let scores = median_rank_ensemble(&seed_scores, &eligible)?;
+        let to_f64 = |values: &[f32]| {
+            values
+                .iter()
+                .map(|value| f64::from(*value))
+                .collect::<Vec<_>>()
+        };
+        let size = panel.alt_beta.as_ref().map(|_| size_exposure(panel, row));
+        let exposures = panel
+            .alt_beta
+            .as_ref()
+            .zip(size.as_ref())
+            .map(|(alt_beta, size)| FactorExposures {
+                alt_beta: &alt_beta[row * width..(row + 1) * width],
+                size,
+            });
         build_daily_weights(
             &scores,
             &eligible,
-            &panel
-                .liquidity_rank
-                .row(row)
-                .iter()
-                .map(|value| f64::from(*value))
-                .collect::<Vec<_>>(),
-            &panel
-                .beta60
-                .row(row)
-                .iter()
-                .map(|value| f64::from(*value))
-                .collect::<Vec<_>>(),
-            &panel
-                .vol20
-                .row(row)
-                .iter()
-                .map(|value| f64::from(*value))
-                .collect::<Vec<_>>(),
-            &PortfolioRules::default(),
+            &to_f64(panel.liquidity_rank.row(row)),
+            &to_f64(panel.beta60.row(row)),
+            &to_f64(panel.vol20.row(row)),
+            exposures,
+            trade_mask,
+            &self.rules,
         )
         .map_err(Into::into)
     }
@@ -1777,13 +1966,17 @@ async fn health() -> &'static str {
 async fn session(State(state): State<AppState>) -> Json<SessionView> {
     // Do not touch SQLite on the hot dashboard path: session start equity is immutable
     // for the lifetime of a paper session and is cached when the process starts.
-    let account = state.engine.lock().snapshot(Utc::now());
+    let (account, funding_pnl) = {
+        let engine = state.engine.lock();
+        (engine.snapshot(Utc::now()), engine.funding_pnl())
+    };
     let runtime = state.runtime.lock().clone();
     Json(SessionView {
         status: runtime.status,
         detail: runtime.detail,
         model: state.model.clone(),
         account,
+        funding_pnl,
         session_start_equity_usd: state.session_start_equity_usd,
         last_decision_date: runtime.last_decision_date,
         last_error: runtime.last_error,
@@ -1813,10 +2006,21 @@ async fn positions(State(state): State<AppState>) -> Json<Vec<PositionView>> {
                     entry_price: position.entry_vwap,
                     mark_price: position.mark_price,
                     unrealized_pnl,
+                    funding_pnl: position.funding_pnl,
                     opened_at: position.opened_at,
                 }
             })
             .collect(),
+    )
+}
+
+async fn funding_events(State(state): State<AppState>) -> Json<Vec<FundingEvent>> {
+    Json(
+        state
+            .ledger
+            .lock()
+            .recent_funding_events(PAPER_SESSION_ID, 200)
+            .unwrap_or_default(),
     )
 }
 
@@ -1837,9 +2041,16 @@ async fn equity(
     Query(query): Query<EquityQuery>,
     State(state): State<AppState>,
 ) -> Json<EquityCurve> {
-    let max_points = query.max_points.unwrap_or(2_000).clamp(200, DASHBOARD_CACHE_POINTS);
+    let max_points = query
+        .max_points
+        .unwrap_or(2_000)
+        .clamp(200, DASHBOARD_CACHE_POINTS);
     let cache = state.dashboard_cache.read();
-    Json(downsample_cached_curve(&cache.curve, &cache.metrics, max_points))
+    Json(downsample_cached_curve(
+        &cache.curve,
+        &cache.metrics,
+        max_points,
+    ))
 }
 
 async fn replay_session(State(state): State<ReplayAppState>) -> Json<SessionView> {
@@ -1848,6 +2059,8 @@ async fn replay_session(State(state): State<ReplayAppState>) -> Json<SessionView
         detail: "Deterministic 1D OOS replay; no network data, order book, or slippage.".to_owned(),
         model: state.model.clone(),
         account: state.account.clone(),
+        // The parity replay reproduces the funding-free Python target-weight series.
+        funding_pnl: 0.0,
         session_start_equity_usd: state.account.equity - state.account.realized_pnl,
         last_decision_date: Some(state.last_decision_date.clone()),
         last_error: None,

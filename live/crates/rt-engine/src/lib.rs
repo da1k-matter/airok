@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use rt_domain::{
-    AccountSnapshot, ExecutionReport, ExecutionRequest, FillStatus, InstrumentRules,
-    OrderBookSnapshot, PaperState, Position, Side,
+    AccountSnapshot, ExecutionReport, ExecutionRequest, FillStatus, FundingEvent,
+    FundingSettlement, FundingState, InstrumentRules, OrderBookSnapshot, PaperState, Position,
+    QuantityChange, Side,
 };
 use rt_execution::{SnapshotExecutionConfig, execute_snapshot_sweep};
 use std::collections::BTreeMap;
@@ -41,6 +42,7 @@ pub struct PaperEngine {
     fee_paid: f64,
     realized_pnl: f64,
     positions: BTreeMap<String, Position>,
+    funding: FundingState,
 }
 
 impl PaperEngine {
@@ -67,6 +69,7 @@ impl PaperEngine {
             fee_paid: 0.0,
             realized_pnl: 0.0,
             positions: BTreeMap::new(),
+            funding: FundingState::default(),
         })
     }
 
@@ -89,10 +92,17 @@ impl PaperEngine {
             fee_paid: self.fee_paid,
             realized_pnl: self.realized_pnl,
             positions: self.positions(),
+            funding: Some(self.funding.clone()),
         }
     }
 
-    pub fn restore(config: PaperConfig, state: PaperState) -> Result<Self, EngineError> {
+    /// Restore a persisted session. Ledgers written before funding was simulated start
+    /// accruing funding for their open positions from `now`.
+    pub fn restore(
+        config: PaperConfig,
+        state: PaperState,
+        now: DateTime<Utc>,
+    ) -> Result<Self, EngineError> {
         let mut engine = Self::new(state.session_id, config)?;
         if !state.cash.is_finite()
             || state.cash <= 0.0
@@ -113,6 +123,28 @@ impl PaperEngine {
             .filter(|position| position.quantity.is_finite() && position.quantity.abs() > EPSILON)
             .map(|position| (position.symbol.clone(), position))
             .collect();
+        engine.funding = match state.funding {
+            Some(funding) if funding.funding_pnl.is_finite() => funding,
+            Some(_) => {
+                return Err(EngineError::InvalidConfig(
+                    "invalid persisted funding state".to_owned(),
+                ));
+            }
+            None => {
+                let mut funding = FundingState::default();
+                for (symbol, position) in &engine.positions {
+                    funding.cursors.insert(symbol.clone(), now);
+                    funding.quantity_log.insert(
+                        symbol.clone(),
+                        vec![QuantityChange {
+                            at: now,
+                            quantity: position.quantity,
+                        }],
+                    );
+                }
+                funding
+            }
+        };
         Ok(engine)
     }
 
@@ -145,6 +177,101 @@ impl PaperEngine {
             gross_notional,
             net_notional,
             fee_paid: self.fee_paid,
+        }
+    }
+
+    /// Cumulative funding received (positive) or paid (negative) by this session.
+    pub fn funding_pnl(&self) -> f64 {
+        self.funding.funding_pnl
+    }
+
+    /// Symbols whose funding settlements after the returned time are not yet accounted.
+    pub fn funding_cursors(&self) -> Vec<(String, DateTime<Utc>)> {
+        self.funding
+            .cursors
+            .iter()
+            .map(|(symbol, cursor)| (symbol.clone(), *cursor))
+            .collect()
+    }
+
+    /// Charge one exchange settlement against the quantity that was held at its timestamp.
+    ///
+    /// A fill exactly at the settlement time does not count, so a position opened at the
+    /// 00:00 decision close does not pay that close's settlement. Settlements at or before the
+    /// symbol's cursor were already accounted and are ignored.
+    pub fn apply_funding(&mut self, settlement: &FundingSettlement) -> Option<FundingEvent> {
+        let cursor = *self.funding.cursors.get(&settlement.symbol)?;
+        if settlement.settled_at <= cursor
+            || !settlement.funding_rate.is_finite()
+            || !settlement.mark_price.is_finite()
+            || settlement.mark_price <= 0.0
+        {
+            return None;
+        }
+        self.funding
+            .cursors
+            .insert(settlement.symbol.clone(), settlement.settled_at);
+        let quantity = self
+            .funding
+            .quantity_log
+            .get(&settlement.symbol)
+            .and_then(|log| {
+                log.iter()
+                    .rev()
+                    .find(|change| change.at < settlement.settled_at)
+            })
+            .map_or(0.0, |change| change.quantity);
+        if quantity.abs() <= EPSILON {
+            return None;
+        }
+        let amount = -quantity * settlement.mark_price * settlement.funding_rate;
+        self.cash += amount;
+        self.funding.funding_pnl += amount;
+        if let Some(position) = self.positions.get_mut(&settlement.symbol) {
+            position.funding_pnl += amount;
+        }
+        Some(FundingEvent {
+            symbol: settlement.symbol.clone(),
+            settled_at: settlement.settled_at,
+            quantity,
+            mark_price: settlement.mark_price,
+            funding_rate: settlement.funding_rate,
+            amount,
+        })
+    }
+
+    /// Record that every settlement of `symbol` up to `checked_through` has been applied,
+    /// and drop quantity history that can no longer price a future settlement.
+    pub fn complete_funding_through(&mut self, symbol: &str, checked_through: DateTime<Utc>) {
+        let Some(cursor) = self.funding.cursors.get_mut(symbol) else {
+            return;
+        };
+        *cursor = (*cursor).max(checked_through);
+        let cursor = *cursor;
+        let Some(log) = self.funding.quantity_log.get_mut(symbol) else {
+            return;
+        };
+        if let Some(last_known) = log.iter().rposition(|change| change.at <= cursor) {
+            log.drain(..last_known);
+        }
+        let flat = log.len() == 1 && log[0].at <= cursor && log[0].quantity.abs() <= EPSILON;
+        if log.is_empty() || flat {
+            self.funding.quantity_log.remove(symbol);
+            self.funding.cursors.remove(symbol);
+        }
+    }
+
+    fn record_quantity_change(&mut self, symbol: &str, quantity: f64, at: DateTime<Utc>) {
+        self.funding.cursors.entry(symbol.to_owned()).or_insert(at);
+        let log = self
+            .funding
+            .quantity_log
+            .entry(symbol.to_owned())
+            .or_default();
+        if let Some(last) = log.last_mut().filter(|last| last.at == at) {
+            last.quantity = quantity;
+        } else {
+            log.push(QuantityChange { at, quantity });
         }
     }
 
@@ -292,6 +419,7 @@ impl PaperEngine {
                 mark_price: fill_price,
                 realized_pnl: 0.0,
                 entry_fees: 0.0,
+                funding_pnl: 0.0,
                 opened_at: now,
                 updated_at: now,
             });
@@ -326,9 +454,19 @@ impl PaperEngine {
         }
         entry.mark_price = fill_price;
         entry.updated_at = now;
-        if entry.quantity.abs() <= EPSILON {
+        let quantity = entry.quantity;
+        if quantity.abs() <= EPSILON {
             self.positions.remove(&report.symbol);
         }
+        self.record_quantity_change(
+            &report.symbol,
+            if quantity.abs() <= EPSILON {
+                0.0
+            } else {
+                quantity
+            },
+            now,
+        );
     }
 }
 
@@ -379,7 +517,7 @@ fn round_down(value: f64, step: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
-    use rt_domain::{InstrumentRules, OrderBookSnapshot, PriceLevel};
+    use rt_domain::{FundingSettlement, InstrumentRules, OrderBookSnapshot, PriceLevel};
 
     use super::{PaperConfig, PaperEngine, RiskLimits};
     use rt_execution::SnapshotExecutionConfig;
@@ -416,6 +554,126 @@ mod tests {
                 quantity: 100.0,
             }],
         }
+    }
+
+    fn rules() -> InstrumentRules {
+        InstrumentRules {
+            symbol: "BTCUSDT".to_owned(),
+            status: "Trading".to_owned(),
+            contract_type: "LinearPerpetual".to_owned(),
+            qty_step: 0.001,
+            min_qty: 0.001,
+            min_notional_value: 5.0,
+            max_market_order_qty: 150.0,
+            tick_size: 0.1,
+        }
+    }
+
+    fn book_at(hour: u32) -> OrderBookSnapshot {
+        OrderBookSnapshot {
+            captured_at: Utc
+                .with_ymd_and_hms(2026, 10, 1, hour, 1, 30)
+                .single()
+                .expect("time"),
+            ..book()
+        }
+    }
+
+    fn settlement(hour: u32, rate: f64) -> FundingSettlement {
+        FundingSettlement {
+            symbol: "BTCUSDT".to_owned(),
+            settled_at: Utc
+                .with_ymd_and_hms(2026, 10, 1, hour, 0, 0)
+                .single()
+                .expect("time"),
+            funding_rate: rate,
+            mark_price: 100.0,
+        }
+    }
+
+    #[test]
+    fn short_receives_positive_funding_priced_at_the_mark() {
+        let mut engine = engine();
+        engine
+            .rebalance_to_notional("d1", "BTCUSDT", -495.0, &rules(), &book_at(0))
+            .expect("rebalance works")
+            .expect("trade is needed");
+        let quantity = engine.positions()[0].quantity;
+        assert!(quantity < 0.0);
+        let cash = engine.persistent_state().cash;
+        let event = engine
+            .apply_funding(&settlement(8, 0.0001))
+            .expect("charged");
+        assert!((event.amount - (-quantity * 100.0 * 0.0001)).abs() < 1e-12);
+        assert!(event.amount > 0.0);
+        assert!((engine.persistent_state().cash - cash - event.amount).abs() < 1e-12);
+        assert!((engine.funding_pnl() - event.amount).abs() < 1e-12);
+        assert!((engine.positions()[0].funding_pnl - event.amount).abs() < 1e-12);
+        // Replaying the same settlement must not charge twice.
+        assert!(engine.apply_funding(&settlement(8, 0.0001)).is_none());
+    }
+
+    #[test]
+    fn settlement_uses_the_quantity_held_at_its_timestamp() {
+        let mut engine = engine();
+        // Opened after the 00:00 settlement: that settlement is not charged.
+        engine
+            .rebalance_to_notional("d1", "BTCUSDT", 495.0, &rules(), &book_at(0))
+            .expect("rebalance works")
+            .expect("trade is needed");
+        let held = engine.positions()[0].quantity;
+        assert!(engine.apply_funding(&settlement(0, 0.01)).is_none());
+        // Closed at 16:01:30, before the 16:00 settlement was processed: it is still charged.
+        engine
+            .rebalance_to_notional("d2", "BTCUSDT", 0.0, &rules(), &book_at(16))
+            .expect("rebalance works")
+            .expect("trade is needed");
+        assert!(engine.positions().is_empty());
+        let event = engine
+            .apply_funding(&settlement(16, 0.001))
+            .expect("charged");
+        assert_eq!(event.quantity, held);
+        assert!(event.amount < 0.0, "longs pay positive funding");
+        // A later settlement finds the position closed.
+        assert!(engine.apply_funding(&settlement(23, 0.001)).is_none());
+        engine.complete_funding_through(
+            "BTCUSDT",
+            Utc.with_ymd_and_hms(2026, 10, 2, 0, 0, 0)
+                .single()
+                .expect("time"),
+        );
+        assert!(engine.funding_cursors().is_empty());
+    }
+
+    #[test]
+    fn funding_state_survives_restore_and_legacy_state_starts_now() {
+        let mut engine = engine();
+        engine
+            .rebalance_to_notional("d1", "BTCUSDT", 495.0, &rules(), &book_at(0))
+            .expect("rebalance works")
+            .expect("trade is needed");
+        engine
+            .apply_funding(&settlement(8, 0.001))
+            .expect("charged");
+        let config = engine.config;
+        let restored =
+            PaperEngine::restore(config, engine.persistent_state(), Utc::now()).expect("restores");
+        assert_eq!(restored.funding_pnl(), engine.funding_pnl());
+        assert_eq!(restored.funding_cursors(), engine.funding_cursors());
+
+        let mut legacy = engine.persistent_state();
+        legacy.funding = None;
+        let now = Utc
+            .with_ymd_and_hms(2026, 10, 1, 12, 0, 0)
+            .single()
+            .expect("time");
+        let mut restored = PaperEngine::restore(config, legacy, now).expect("restores");
+        assert_eq!(
+            restored.funding_cursors(),
+            vec![("BTCUSDT".to_owned(), now)]
+        );
+        assert!(restored.apply_funding(&settlement(8, 0.001)).is_none());
+        assert!(restored.apply_funding(&settlement(16, 0.001)).is_some());
     }
 
     #[test]

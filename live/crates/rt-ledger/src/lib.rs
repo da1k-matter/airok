@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rt_domain::{AccountSnapshot, ExecutionReport, OrderBookSnapshot, PaperState};
+use rt_domain::{AccountSnapshot, ExecutionReport, FundingEvent, OrderBookSnapshot, PaperState};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::{path::Path, time::Duration};
 
@@ -202,6 +202,66 @@ impl Ledger {
         Ok(())
     }
 
+    /// Record one funding settlement; replays of an already recorded settlement are ignored.
+    pub fn record_funding_event(&self, session_id: &str, event: &FundingEvent) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO funding_events (
+                session_id, symbol, settled_at, quantity, mark_price, funding_rate, amount
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                session_id,
+                event.symbol,
+                timestamp(event.settled_at),
+                event.quantity,
+                event.mark_price,
+                event.funding_rate,
+                event.amount,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn recent_funding_events(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<FundingEvent>> {
+        let mut statement = self.connection.prepare(
+            "SELECT symbol, settled_at, quantity, mark_price, funding_rate, amount
+             FROM funding_events WHERE session_id = ?1
+             ORDER BY settled_at DESC, symbol LIMIT ?2",
+        )?;
+        let events = statement
+            .query_map(params![session_id, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, f64>(4)?,
+                    row.get::<_, f64>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(
+                |(symbol, settled_at, quantity, mark_price, funding_rate, amount)| {
+                    Ok(FundingEvent {
+                        symbol,
+                        settled_at: DateTime::parse_from_rfc3339(&settled_at)
+                            .context("decode funding settlement time")?
+                            .with_timezone(&Utc),
+                        quantity,
+                        mark_price,
+                        funding_rate,
+                        amount,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+        Ok(events)
+    }
+
     pub fn recent_executions(&self, limit: usize) -> Result<Vec<ExecutionReport>> {
         let mut statement = self
             .connection
@@ -384,13 +444,15 @@ impl Ledger {
     }
 
     pub fn closed_trade_count(&self) -> Result<usize> {
-        self.connection.query_row(
-            "SELECT COUNT(*)
+        self.connection
+            .query_row(
+                "SELECT COUNT(*)
              FROM executions
              WHERE COALESCE(json_extract(report_json, '$.closed_quantity'), 0.0) > 0.0",
-            [],
-            |row| row.get(0),
-        ).context("count closed executions")
+                [],
+                |row| row.get(0),
+            )
+            .context("count closed executions")
     }
 
     pub fn save_engine_state(&self, state: &PaperState, updated_at: DateTime<Utc>) -> Result<()> {
@@ -524,6 +586,18 @@ impl Ledger {
                 decision_id TEXT PRIMARY KEY,
                 decided_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS funding_events (
+                session_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                settled_at TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                mark_price REAL NOT NULL,
+                funding_rate REAL NOT NULL,
+                amount REAL NOT NULL,
+                PRIMARY KEY(session_id, symbol, settled_at)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS funding_events_time
+                ON funding_events(session_id, settled_at DESC);
             ",
         )?;
         self.connection
@@ -765,10 +839,7 @@ fn upsert_drawdown_minute_in(
     Ok(())
 }
 
-fn recompute_equity_return_stats_in(
-    transaction: &Transaction<'_>,
-    session_id: &str,
-) -> Result<()> {
+fn recompute_equity_return_stats_in(transaction: &Transaction<'_>, session_id: &str) -> Result<()> {
     transaction.execute(
         "DELETE FROM equity_return_stats WHERE session_id=?1",
         [session_id],
@@ -954,10 +1025,7 @@ fn record_equity_point_in(transaction: &Transaction<'_>, snapshot: &AccountSnaps
     Ok(())
 }
 
-pub fn downsample_equity_history(
-    source: &[EquityBucket],
-    max_buckets: usize,
-) -> Vec<EquityBucket> {
+pub fn downsample_equity_history(source: &[EquityBucket], max_buckets: usize) -> Vec<EquityBucket> {
     let max_buckets = max_buckets.max(1);
     if source.len() <= max_buckets {
         return source.to_vec();
@@ -991,8 +1059,7 @@ pub fn downsample_equity_history(
         aggregate.low = aggregate.low.min(point.low);
         aggregate.high = aggregate.high.max(point.high);
         if point.drawdown < aggregate.drawdown
-            || (point.drawdown == aggregate.drawdown
-                && point.drawdown_at < aggregate.drawdown_at)
+            || (point.drawdown == aggregate.drawdown && point.drawdown_at < aggregate.drawdown_at)
         {
             aggregate.drawdown = point.drawdown;
             aggregate.drawdown_at = point.drawdown_at;
@@ -1024,6 +1091,37 @@ mod tests {
     };
 
     use super::{DailyPeriodReturn, Ledger, summarize_periods};
+
+    #[test]
+    fn funding_events_are_recorded_once_and_read_newest_first() {
+        let ledger = Ledger::open(":memory:").expect("ledger opens");
+        let at = Utc::now().with_nanosecond(0).expect("time");
+        let event = |hours: i64, amount: f64| rt_domain::FundingEvent {
+            symbol: "BTCUSDT".to_owned(),
+            settled_at: at + Duration::hours(hours),
+            quantity: -0.5,
+            mark_price: 100.0,
+            funding_rate: amount / 50.0,
+            amount,
+        };
+        ledger
+            .record_funding_event("s", &event(0, 0.1))
+            .expect("records");
+        ledger
+            .record_funding_event("s", &event(8, 0.2))
+            .expect("records");
+        ledger
+            .record_funding_event("s", &event(8, 9.9))
+            .expect("duplicate ignored");
+        let events = ledger.recent_funding_events("s", 10).expect("reads");
+        assert_eq!(events, vec![event(8, 0.2), event(0, 0.1)]);
+        assert!(
+            ledger
+                .recent_funding_events("other", 10)
+                .expect("reads")
+                .is_empty()
+        );
+    }
 
     #[test]
     fn stores_account_snapshots_in_wal_database() {

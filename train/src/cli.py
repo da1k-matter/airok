@@ -33,6 +33,13 @@ def parser() -> argparse.ArgumentParser:
             command.add_argument("--fresh-features", action="store_true")
         if name in {"train", "backtest", "run"}:
             command.add_argument("--fresh-predictions", action="store_true")
+        if name in {"backtest", "run"}:
+            command.add_argument(
+                "--funding",
+                action=argparse.BooleanOptionalAction,
+                default=None,
+                help="Charge perpetual funding (default: costs.funding.enabled from YAML)",
+            )
     return root
 
 
@@ -51,6 +58,15 @@ def print_summary(summary: dict) -> None:
         print(f"  max drawdown:    {row['max_dd']:.2%}")
         print(f"  positive months: {row['positive_months']}/{row['n_months']}")
         print(f"  turnover/year:   {row['turnover_pa']:.2f}x")
+        if "without_funding" in summary:
+            base = summary["without_funding"][label]
+            flow = summary["funding"][label]
+            print(f"  funding/year:    {flow['annualized']:+.2%} (longs {flow['long_side_annualized']:+.2%}, "
+                  f"shorts {flow['short_side_annualized']:+.2%})")
+            print(f"  without funding: CAGR {base['cagr']:.2%}, Sharpe {base['sharpe']:.3f}, "
+                  f"max DD {base['max_dd']:.2%}")
+    if not summary.get("funding", {}).get("enabled"):
+        print("\nfunding: not charged")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -74,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
                 config,
                 reuse_features=reuse_features,
                 reuse_predictions=reuse_predictions,
+                funding=args.funding,
             )
         else:
             ctx = get_context(config, reuse=reuse_features)
@@ -82,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
                 count = len(predictions)
                 print(f"prediction matrices ready: {count}; cache={config.cache_dir / 'predictions'}")
                 return 0
-            output, summary = backtest(config, ctx, predictions)
+            output, summary = backtest(config, ctx, predictions, funding=args.funding)
         print_summary(summary)
         print(f"\noutputs: {output}")
         return 0

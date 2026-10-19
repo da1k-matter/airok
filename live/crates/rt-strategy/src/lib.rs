@@ -13,6 +13,19 @@ pub struct PortfolioRules {
     pub dollar_neutral: bool,
     pub btc_beta_neutral: bool,
     pub smoothing_days: usize,
+    /// Blend weight of the book that is also neutral to the alt index (and size); 0 disables it.
+    #[serde(default)]
+    pub alt_beta_neutral: f64,
+    /// Also neutralize the cross-sectional size z-score inside the alt-neutral book.
+    #[serde(default)]
+    pub size_neutral: bool,
+}
+
+/// Per-asset exposures, known at the decision close, for the alt-neutral book.
+#[derive(Debug, Clone, Copy)]
+pub struct FactorExposures<'a> {
+    pub alt_beta: &'a [f64],
+    pub size: &'a [f64],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -46,6 +59,8 @@ impl Default for PortfolioRules {
             dollar_neutral: true,
             btc_beta_neutral: true,
             smoothing_days: 21,
+            alt_beta_neutral: 0.5,
+            size_neutral: true,
         }
     }
 }
@@ -164,45 +179,86 @@ pub fn median_rank_ensemble(
         .iter()
         .map(|scores| cross_section_rank_percentile(scores, eligible))
         .collect::<Result<Vec<_>, _>>()?;
+    // The research ensemble stores seed ranks as float32 and takes numpy's float32 nanmedian.
+    // Matching that rounding matters: equal true ranks must tie exactly so that the stable
+    // sort orders them by column, as numpy's stable argsort does.
     let mut result = vec![f64::NAN; eligible.len()];
     for index in 0..eligible.len() {
         let mut values = ranks
             .iter()
-            .map(|rank| rank[index])
+            .map(|rank| rank[index] as f32)
             .filter(|value| value.is_finite())
             .collect::<Vec<_>>();
         if values.is_empty() {
             continue;
         }
-        values.sort_by(f64::total_cmp);
+        values.sort_by(f32::total_cmp);
         let middle = values.len() / 2;
-        result[index] = if values.len().is_multiple_of(2) {
+        result[index] = f64::from(if values.len().is_multiple_of(2) {
             (values[middle - 1] + values[middle]) / 2.0
         } else {
             values[middle]
-        };
+        });
     }
     Ok(result)
 }
 
+/// Cross-sectional z-score over eligible finite values (population std); missing results are zero.
+pub fn cross_sectional_z(values: &[f64], eligible: &[bool]) -> Vec<f64> {
+    let members = values
+        .iter()
+        .zip(eligible)
+        .filter(|(value, eligible)| **eligible && value.is_finite())
+        .map(|(value, _)| *value)
+        .collect::<Vec<_>>();
+    if members.is_empty() {
+        return vec![0.0; values.len()];
+    }
+    let mean = members.iter().sum::<f64>() / members.len() as f64;
+    let std = (members
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / members.len() as f64)
+        .sqrt();
+    let scale = if std > 1e-12 { std } else { 1.0 };
+    values
+        .iter()
+        .map(|value| {
+            let z = (value - mean) / scale;
+            if z.is_finite() { z } else { 0.0 }
+        })
+        .collect()
+}
+
+/// Build one decision's raw long/short weights.
+///
+/// `trade_mask` restricts the tradable names (e.g. Copy Trading); the liquidity-ranked
+/// universe is then formed among the allowed names only.
 pub fn build_daily_weights(
     scores: &[f64],
     eligible: &[bool],
     liquidity_rank: &[f64],
     beta: &[f64],
     volatility: &[f64],
+    exposures: Option<FactorExposures<'_>>,
+    trade_mask: Option<&[bool]>,
     rules: &PortfolioRules,
 ) -> Result<Vec<f64>, StrategyError> {
     let count = scores.len();
-    if [
+    let mut lengths = vec![
         eligible.len(),
         liquidity_rank.len(),
         beta.len(),
         volatility.len(),
-    ]
-    .iter()
-    .any(|length| *length != count)
-    {
+    ];
+    if let Some(exposures) = exposures {
+        lengths.extend([exposures.alt_beta.len(), exposures.size.len()]);
+    }
+    if let Some(mask) = trade_mask {
+        lengths.push(mask.len());
+    }
+    if lengths.iter().any(|length| *length != count) {
         return Err(StrategyError::LengthMismatch);
     }
     if rules.tail_count == 0 || rules.universe_size == 0 || rules.smoothing_days == 0 {
@@ -210,17 +266,40 @@ pub fn build_daily_weights(
             "positive sizes are required".to_owned(),
         ));
     }
-    let mut candidates = (0..count)
-        .filter(|index| {
-            eligible[*index]
-                && liquidity_rank[*index].is_finite()
-                && liquidity_rank[*index] <= rules.universe_size as f64
-                && scores[*index].is_finite()
-                && beta[*index].is_finite()
-                && volatility[*index].is_finite()
-                && volatility[*index] > 1e-5
-        })
-        .collect::<Vec<_>>();
+    if !(0.0..=1.0).contains(&rules.alt_beta_neutral) {
+        return Err(StrategyError::InvalidRule(
+            "alt_beta_neutral must be within [0, 1]".to_owned(),
+        ));
+    }
+    let alt_exposures = if rules.alt_beta_neutral > 0.0 {
+        Some(exposures.ok_or_else(|| {
+            StrategyError::InvalidRule("alt-index neutralization needs factor exposures".to_owned())
+        })?)
+    } else {
+        None
+    };
+    let valid = |index: &usize| {
+        eligible[*index]
+            && liquidity_rank[*index].is_finite()
+            && scores[*index].is_finite()
+            && beta[*index].is_finite()
+            && volatility[*index].is_finite()
+            && volatility[*index] > 1e-5
+    };
+    let mut candidates = match trade_mask {
+        None => (0..count)
+            .filter(|index| valid(index) && liquidity_rank[*index] <= rules.universe_size as f64)
+            .collect::<Vec<_>>(),
+        Some(mask) => {
+            let mut allowed = (0..count)
+                .filter(|index| valid(index) && mask[*index])
+                .collect::<Vec<_>>();
+            allowed.sort_by(|left, right| liquidity_rank[*left].total_cmp(&liquidity_rank[*right]));
+            allowed.truncate(rules.universe_size);
+            allowed.sort_unstable();
+            allowed
+        }
+    };
     if candidates.len() < rules.minimum_universe {
         return Ok(vec![0.0; count]);
     }
@@ -241,7 +320,25 @@ pub fn build_daily_weights(
         weights[*index] = -0.5 * side_weight;
     }
     if rules.dollar_neutral || rules.btc_beta_neutral {
+        let raw = weights.clone();
         project_dollar_and_beta(&mut weights, beta);
+        if let Some(exposures) = alt_exposures {
+            let mut factors = vec![exposures.alt_beta];
+            if rules.size_neutral {
+                factors.push(exposures.size);
+            }
+            let full = project_onto_complement(&raw, beta, &factors);
+            let strength = rules.alt_beta_neutral;
+            for (weight, neutral) in weights.iter_mut().zip(full) {
+                *weight = (1.0 - strength) * *weight + strength * neutral;
+            }
+            let gross = weights.iter().map(|value| value.abs()).sum::<f64>();
+            if gross > 1e-8 {
+                for value in &mut weights {
+                    *value /= gross;
+                }
+            }
+        }
     }
     Ok(weights)
 }
@@ -351,6 +448,103 @@ fn quantile_linear(values: &[f64], percentile: f64) -> f64 {
     values[lower] + (values[upper] - values[lower]) * (index - lower as f64)
 }
 
+/// Remove the ridge projection of the selected weights onto [1, beta, factors...] and
+/// normalize gross to one, exactly as the research `_project_dollar_and_beta` with extra betas.
+fn project_onto_complement(weights: &[f64], beta: &[f64], factors: &[&[f64]]) -> Vec<f64> {
+    let selected = weights
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (*value != 0.0).then_some(index))
+        .collect::<Vec<_>>();
+    let mut output = vec![0.0; weights.len()];
+    if selected.len() < 4 {
+        return output;
+    }
+    let finite_or_zero = |value: f64| if value.is_finite() { value } else { 0.0 };
+    let mut rows = vec![
+        vec![1.0; selected.len()],
+        selected
+            .iter()
+            .map(|index| beta[*index])
+            .collect::<Vec<_>>(),
+    ];
+    for factor in factors {
+        rows.push(
+            selected
+                .iter()
+                .map(|index| finite_or_zero(factor[*index]))
+                .collect(),
+        );
+    }
+    let raw = selected
+        .iter()
+        .map(|index| weights[*index])
+        .collect::<Vec<_>>();
+    let k = rows.len();
+    let dot = |left: &[f64], right: &[f64]| left.iter().zip(right).map(|(a, b)| a * b).sum::<f64>();
+    let mut gram = vec![vec![0.0; k]; k];
+    for i in 0..k {
+        for j in 0..k {
+            gram[i][j] = dot(&rows[i], &rows[j]) + if i == j { 1e-6 } else { 0.0 };
+        }
+    }
+    let rhs = rows.iter().map(|row| dot(row, &raw)).collect::<Vec<_>>();
+    let Some(coefficients) = solve_linear(gram, rhs) else {
+        return output;
+    };
+    let neutral = (0..selected.len())
+        .map(|position| {
+            raw[position]
+                - (0..k)
+                    .map(|factor| rows[factor][position] * coefficients[factor])
+                    .sum::<f64>()
+        })
+        .collect::<Vec<_>>();
+    let gross = neutral.iter().map(|value| value.abs()).sum::<f64>();
+    if gross > 1e-8 && gross.is_finite() {
+        for (index, value) in selected.iter().zip(neutral) {
+            output[*index] = value / gross;
+        }
+    }
+    output
+}
+
+/// Gaussian elimination with partial pivoting (the LU scheme numpy's `solve` uses).
+fn solve_linear(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Option<Vec<f64>> {
+    let n = rhs.len();
+    for column in 0..n {
+        let pivot = (column..n).max_by(|left, right| {
+            matrix[*left][column]
+                .abs()
+                .total_cmp(&matrix[*right][column].abs())
+        })?;
+        if !matrix[pivot][column].is_finite() || matrix[pivot][column].abs() <= 1e-300 {
+            return None;
+        }
+        matrix.swap(column, pivot);
+        rhs.swap(column, pivot);
+        for row in column + 1..n {
+            let factor = matrix[row][column] / matrix[column][column];
+            let (upper, lower) = matrix.split_at_mut(row);
+            for (target, source) in lower[0][column..].iter_mut().zip(&upper[column][column..]) {
+                *target -= factor * source;
+            }
+            rhs[row] -= factor * rhs[column];
+        }
+    }
+    let mut solution = vec![0.0; n];
+    for row in (0..n).rev() {
+        let tail = (row + 1..n)
+            .map(|inner| matrix[row][inner] * solution[inner])
+            .sum::<f64>();
+        solution[row] = (rhs[row] - tail) / matrix[row][row];
+    }
+    solution
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(solution)
+}
+
 fn project_dollar_and_beta(weights: &mut [f64], beta: &[f64]) {
     let selected = weights
         .iter()
@@ -398,9 +592,138 @@ fn project_dollar_and_beta(weights: &mut [f64], beta: &[f64]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        OverlayRules, PortfolioRules, apply_volatility_overlay, build_daily_weights,
-        airok_feature_names, cross_section_rank_percentile, median_rank_ensemble,
+        FactorExposures, OverlayRules, PortfolioRules, airok_feature_names,
+        apply_volatility_overlay, build_daily_weights, cross_section_rank_percentile,
+        cross_sectional_z, median_rank_ensemble,
     };
+
+    fn sample(count: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+        let scores = (0..count)
+            .map(|value| ((value * 7) % count) as f64)
+            .collect();
+        let beta = (0..count).map(|value| 0.5 + value as f64 / 20.0).collect();
+        let alt = (0..count)
+            .map(|value| 1.0 + ((value * 3) % 5) as f64 / 4.0)
+            .collect();
+        let size = (0..count)
+            .map(|value| (value as f64 - 10.0) / 6.0)
+            .collect();
+        (scores, beta, alt, size)
+    }
+
+    #[test]
+    fn full_alt_neutral_book_has_no_alt_or_size_exposure() {
+        let (scores, beta, alt, size) = sample(24);
+        let weights = build_daily_weights(
+            &scores,
+            &[true; 24],
+            &[1.0; 24],
+            &beta,
+            &[0.02; 24],
+            Some(FactorExposures {
+                alt_beta: &alt,
+                size: &size,
+            }),
+            None,
+            &PortfolioRules {
+                tail_count: 4,
+                alt_beta_neutral: 1.0,
+                ..PortfolioRules::default()
+            },
+        )
+        .expect("weights");
+        let exposure = |factor: &[f64]| {
+            weights
+                .iter()
+                .zip(factor)
+                .map(|(w, f)| w * f)
+                .sum::<f64>()
+                .abs()
+        };
+        assert!(weights.iter().sum::<f64>().abs() < 1e-5);
+        assert!(exposure(&beta) < 1e-5);
+        assert!(exposure(&alt) < 1e-5);
+        assert!(exposure(&size) < 1e-5);
+        assert!((weights.iter().map(|value| value.abs()).sum::<f64>() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn partial_neutralization_blends_both_books_at_unit_gross() {
+        let (scores, beta, alt, size) = sample(24);
+        let build = |strength: f64| {
+            build_daily_weights(
+                &scores,
+                &[true; 24],
+                &[1.0; 24],
+                &beta,
+                &[0.02; 24],
+                Some(FactorExposures {
+                    alt_beta: &alt,
+                    size: &size,
+                }),
+                None,
+                &PortfolioRules {
+                    tail_count: 4,
+                    alt_beta_neutral: strength,
+                    ..PortfolioRules::default()
+                },
+            )
+            .expect("weights")
+        };
+        let (btc_only, full, half) = (build(0.0), build(1.0), build(0.5));
+        let blended = btc_only
+            .iter()
+            .zip(&full)
+            .map(|(a, b)| 0.5 * a + 0.5 * b)
+            .collect::<Vec<_>>();
+        let gross = blended.iter().map(|value| value.abs()).sum::<f64>();
+        for (expected, actual) in blended.iter().zip(&half) {
+            assert!((expected / gross - actual).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn trade_mask_forms_the_liquid_universe_after_filtering() {
+        let count = 30;
+        let scores = (0..count).map(|value| value as f64).collect::<Vec<_>>();
+        let rank = (0..count)
+            .map(|value| value as f64 + 1.0)
+            .collect::<Vec<_>>();
+        let mask = (0..count).map(|value| value % 2 == 0).collect::<Vec<_>>();
+        let weights = build_daily_weights(
+            &scores,
+            &vec![true; count],
+            &rank,
+            &vec![1.0; count],
+            &vec![0.02; count],
+            None,
+            Some(&mask),
+            &PortfolioRules {
+                universe_size: 10,
+                tail_count: 2,
+                minimum_universe: 4,
+                alt_beta_neutral: 0.0,
+                btc_beta_neutral: false,
+                dollar_neutral: false,
+                ..PortfolioRules::default()
+            },
+        )
+        .expect("weights");
+        // Allowed names are the even columns; the 10 most liquid of them are 0, 2, ..., 18.
+        let held = (0..count)
+            .filter(|index| weights[*index] != 0.0)
+            .collect::<Vec<_>>();
+        assert_eq!(held, vec![0, 2, 16, 18]);
+    }
+
+    #[test]
+    fn z_score_uses_eligible_names_and_zeroes_missing_values() {
+        let z = cross_sectional_z(&[1.0, 3.0, 100.0, f64::NAN], &[true, true, false, true]);
+        assert_eq!(z[0], -1.0);
+        assert_eq!(z[1], 1.0);
+        assert_eq!(z[2], 98.0);
+        assert_eq!(z[3], 0.0);
+    }
 
     #[test]
     fn feature_contract_matches_current_airok_width() {
@@ -427,8 +750,11 @@ mod tests {
             &[1.0; 20],
             &beta,
             &[0.02; 20],
+            None,
+            None,
             &PortfolioRules {
                 tail_count: 3,
+                alt_beta_neutral: 0.0,
                 ..PortfolioRules::default()
             },
         )
@@ -478,6 +804,24 @@ mod tests {
             &[true, true, true],
         )
         .expect("ensemble");
-        assert_eq!(result, vec![1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0]);
+        let expected = [1.0_f32 / 3.0, 2.0 / 3.0, 2.0 / 3.0].map(f64::from);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn even_seed_medians_round_like_float32_numpy() {
+        // True medians of both assets are 0.06; float32 rounding must make them tie exactly.
+        let eligible = vec![true; 150];
+        let seed = |first: usize, second: usize| {
+            (0..150)
+                .map(|index| match index {
+                    0 => first as f64,
+                    1 => second as f64,
+                    other => 1000.0 + other as f64,
+                })
+                .collect::<Vec<_>>()
+        };
+        let result = median_rank_ensemble(&[seed(8, 9), seed(10, 9)], &eligible).expect("ensemble");
+        assert_eq!(result[0], result[1]);
     }
 }

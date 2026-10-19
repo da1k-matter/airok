@@ -127,6 +127,110 @@ impl BybitPublicClient {
         }
     }
 
+    /// Fetch every funding settlement of `symbol` with `after < time <= through`, oldest first.
+    pub async fn funding_history(
+        &self,
+        symbol: &str,
+        after: DateTime<Utc>,
+        through: DateTime<Utc>,
+    ) -> Result<Vec<(DateTime<Utc>, f64)>> {
+        let url = format!("{}/v5/market/funding/history", self.rest_url);
+        let start_ms = after.timestamp_millis() + 1;
+        let mut end_ms = through.timestamp_millis();
+        let mut rows = BTreeMap::new();
+        while end_ms >= start_ms {
+            let payload: ApiEnvelope<FundingHistoryResult> = self
+                .http
+                .get(&url)
+                .query(&[
+                    ("category", "linear"),
+                    ("symbol", symbol),
+                    ("startTime", &start_ms.to_string()),
+                    ("endTime", &end_ms.to_string()),
+                    ("limit", "200"),
+                ])
+                .send()
+                .await
+                .context("request Bybit funding history")?
+                .error_for_status()
+                .context("Bybit funding history HTTP status")?
+                .json()
+                .await
+                .context("decode Bybit funding history")?;
+            ensure_success(&payload)?;
+            let list = payload
+                .result
+                .context("Bybit funding history missing result")?
+                .list;
+            let page = list.len();
+            let mut earliest = i64::MAX;
+            for row in list {
+                let timestamp = row
+                    .funding_rate_timestamp
+                    .parse::<i64>()
+                    .context("parse funding timestamp")?;
+                let rate = row
+                    .funding_rate
+                    .parse::<f64>()
+                    .context("parse funding rate")?;
+                earliest = earliest.min(timestamp);
+                if timestamp >= start_ms && timestamp <= through.timestamp_millis() {
+                    let at = DateTime::<Utc>::from_timestamp_millis(timestamp)
+                        .context("funding timestamp out of range")?;
+                    rows.insert(timestamp, (at, rate));
+                }
+            }
+            if page < 200 || earliest == i64::MAX || earliest > end_ms {
+                break;
+            }
+            end_ms = earliest - 1;
+        }
+        Ok(rows.into_values().collect())
+    }
+
+    /// Mark price at `at`: the open of the one-minute mark-price candle starting at `at`.
+    pub async fn mark_price_at(&self, symbol: &str, at: DateTime<Utc>) -> Result<f64> {
+        let url = format!("{}/v5/market/mark-price-kline", self.rest_url);
+        let start = at.timestamp_millis();
+        let payload: ApiEnvelope<KlineResult> = self
+            .http
+            .get(&url)
+            .query(&[
+                ("category", "linear"),
+                ("symbol", symbol),
+                ("interval", "1"),
+                ("start", &start.to_string()),
+                ("end", &start.to_string()),
+                ("limit", "1"),
+            ])
+            .send()
+            .await
+            .context("request Bybit mark-price kline")?
+            .error_for_status()
+            .context("Bybit mark-price kline HTTP status")?
+            .json()
+            .await
+            .context("decode Bybit mark-price kline")?;
+        ensure_success(&payload)?;
+        let list = payload
+            .result
+            .context("Bybit mark-price kline missing result")?
+            .list;
+        let row = list
+            .iter()
+            .find(|row| row.first().is_some_and(|value| value == &start.to_string()))
+            .with_context(|| format!("no {symbol} mark-price candle at {at}"))?;
+        let open = row
+            .get(1)
+            .context("mark-price candle has no open")?
+            .parse::<f64>()
+            .context("parse mark price")?;
+        if !open.is_finite() || open <= 0.0 {
+            bail!("invalid {symbol} mark price {open} at {at}");
+        }
+        Ok(open)
+    }
+
     /// Fetch all daily candles whose open time is in the requested inclusive interval.
     pub async fn daily_klines_range(
         &self,
@@ -395,6 +499,19 @@ struct OrderBookResult {
 #[derive(Debug, Deserialize)]
 struct KlineResult {
     list: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FundingHistoryResult {
+    list: Vec<FundingHistoryRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FundingHistoryRow {
+    #[serde(rename = "fundingRate")]
+    funding_rate: String,
+    #[serde(rename = "fundingRateTimestamp")]
+    funding_rate_timestamp: String,
 }
 
 #[derive(Debug, Deserialize)]

@@ -587,6 +587,88 @@ pub fn build_features(
     })
 }
 
+/// Rolling beta of every asset to the equal-weighted eligible-universe return, known at each close.
+///
+/// Mirrors the research `alt_index_beta`: each pandas rolling mean (window, min_periods = window/2)
+/// skips missing values independently, and the covariance uses the population variance of the index.
+pub fn alt_index_beta(panel: &FeaturePanel, window: usize) -> Vec<f64> {
+    let (rows, cols) = (panel.ret1.rows, panel.ret1.cols);
+    let minimum = window / 2;
+    let mut index = vec![f64::NAN; rows];
+    for (row, value) in index.iter_mut().enumerate() {
+        let (mut sum, mut count) = (0.0_f64, 0_usize);
+        for col in 0..cols {
+            let ret = f64::from(panel.ret1.get(row, col));
+            if panel.eligible_max[row * cols + col] && ret.is_finite() {
+                sum += ret;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            *value = sum / count as f64;
+        }
+    }
+    let mut market_mean = vec![f64::NAN; rows];
+    let mut market_var = vec![f64::NAN; rows];
+    for row in 0..rows {
+        let start = (row + 1).saturating_sub(window);
+        let values = index[start..=row]
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect::<Vec<_>>();
+        if values.len() >= minimum.max(1) {
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            market_mean[row] = mean;
+            market_var[row] = values
+                .iter()
+                .map(|value| (value - mean).powi(2))
+                .sum::<f64>()
+                / values.len() as f64;
+        }
+    }
+    let mut beta = vec![f64::NAN; rows * cols];
+    for col in 0..cols {
+        for row in 0..rows {
+            if !market_var[row].is_finite() {
+                continue;
+            }
+            let start = (row + 1).saturating_sub(window);
+            let (mut sum_r, mut count_r, mut sum_rm, mut count_rm) =
+                (0.0_f64, 0_usize, 0.0_f64, 0_usize);
+            for past in start..=row {
+                let ret = f64::from(panel.ret1.get(past, col));
+                if ret.is_finite() {
+                    sum_r += ret;
+                    count_r += 1;
+                    if index[past].is_finite() {
+                        sum_rm += ret * index[past];
+                        count_rm += 1;
+                    }
+                }
+            }
+            if count_r < minimum || count_rm < minimum {
+                continue;
+            }
+            let covariance = sum_rm / count_rm as f64 - sum_r / count_r as f64 * market_mean[row];
+            beta[row * cols + col] = (covariance / market_var[row]).clamp(-3.0, 5.0);
+        }
+    }
+    beta
+}
+
+/// Cross-sectional z-score of 20-day log dollar volume over the eligible universe at `row`.
+pub fn size_exposure(panel: &FeaturePanel, row: usize) -> Vec<f64> {
+    let cols = panel.dvol20.cols;
+    let values = panel
+        .dvol20
+        .row(row)
+        .iter()
+        .map(|value| f64::from(*value))
+        .collect::<Vec<_>>();
+    rt_strategy::cross_sectional_z(&values, &panel.eligible_max[row * cols..(row + 1) * cols])
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct CsvRow {
     timestamp: String,

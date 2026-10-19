@@ -386,7 +386,7 @@ function renderPositions(rows, executions, equity) {
   const preparedRows = rows.map(row => ({ ...row, lot_pct: equity > 0 ? row.notional / equity * 100 : 0, slippage_bps: latestSlippage.get(row.symbol) }));
   const sortedRows = sortRows(preparedRows, 'positions');
   document.querySelector('#position-count').textContent = rows.length.toLocaleString(); document.querySelector('#positions-meta').textContent = rows.length ? `${rows.length} active instruments` : 'No active positions';
-  document.querySelector('#positions-body').innerHTML = sortedRows.map(row => `<tr><td class="symbol">${escapeHtml(row.symbol)}</td><td><span class="side side-${escapeHtml(row.side)}">${escapeHtml(row.side)}</span></td><td class="num">${row.lot_pct.toFixed(2)}%</td><td class="num">${money(row.notional)}</td><td class="num">${price(row.entry_price)}</td><td class="num">${price(row.mark_price)}</td><td class="num ${classFor(row.unrealized_pnl)}">${signedMoney(row.unrealized_pnl)}</td><td class="num warn">${slippage(row.slippage_bps)}</td><td>${timestamp(row.opened_at)}</td></tr>`).join('');
+  document.querySelector('#positions-body').innerHTML = sortedRows.map(row => `<tr><td class="symbol">${escapeHtml(row.symbol)}</td><td><span class="side side-${escapeHtml(row.side)}">${escapeHtml(row.side)}</span></td><td class="num">${row.lot_pct.toFixed(2)}%</td><td class="num">${money(row.notional)}</td><td class="num">${price(row.entry_price)}</td><td class="num">${price(row.mark_price)}</td><td class="num ${classFor(row.unrealized_pnl)}">${signedMoney(row.unrealized_pnl)}</td><td class="num ${classFor(row.funding_pnl)}">${signedMoney(row.funding_pnl ?? 0)}</td><td class="num warn">${slippage(row.slippage_bps)}</td><td>${timestamp(row.opened_at)}</td></tr>`).join('');
   document.querySelector('#positions-empty').style.display = rows.length ? 'none' : 'block';
   renderSortIndicators('positions');
 }
@@ -438,6 +438,7 @@ async function refreshSession() {
     setTerminalMode('normal');
     document.querySelector('#equity').textContent = money(account.equity);
     document.querySelector('#fees').textContent = money(account.fee_paid);
+    document.querySelector('#funding-caption').textContent = `Funding ${signedMoney(session.funding_pnl ?? 0)} (in equity)`;
     document.querySelector('#model-info').textContent = `Frozen ${session.model.backend.toUpperCase()} ensemble · h${session.model.horizon_days} · ${session.model.seed_count} seeds · cut-off ${session.model.cutoff_date}`;
     renderAccountPerformance(currentEquity, sessionInitialEquity);
     if (positionsLoaded) renderPositions(latestPositions, latestTrades, currentEquity);

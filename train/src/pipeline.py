@@ -17,11 +17,13 @@ import yaml
 from bybit import BybitInstrumentRule, fetch_copy_trading_base_symbols, fetch_linear_perpetual_rules
 from config import ExperimentConfig
 from data import data_fingerprint, load_context, load_panel, save_context, validate_data
+from funding import load_funding_factors
 from portfolio import (
     average_portfolios,
     build_weights,
     simulate_bybit_market_pnl,
     simulate_target_weight_pnl,
+    target_weight_funding,
 )
 from reporting import environment_text, git_commit, metrics, save_plots, yearly_table
 from research import (
@@ -33,18 +35,65 @@ from research import (
     rank_model_scores,
     train_walk_forward,
 )
+from series import load_daily_series
 
 LOG = logging.getLogger(__name__)
 
 
 def model_spec(config: ExperimentConfig) -> ModelSpec:
-    return ModelSpec(horizon=int(config.raw["model"]["horizon"]))
+    model = config.section("model")
+    return ModelSpec(horizon=int(model["horizon"]), target=str(model.get("target", "residual")))
+
+
+def model_specs(config: ExperimentConfig) -> list[ModelSpec]:
+    """One spec per ensemble horizon (`model.horizons`), defaulting to `model.horizon`."""
+    base = model_spec(config)
+    horizons = config.section("model").get("horizons") or [base.horizon]
+    sides = ["long", "short"] if bool(config.section("model").get("short_model", False)) else ["long"]
+    return [ModelSpec(horizon=int(horizon), target=base.target, side=side) for side in sides for horizon in horizons]
+
+
+def uses_funding_features(config: ExperimentConfig) -> bool:
+    return bool(config.section("features").get("funding", False))
+
+
+SERIES_FEATURES = {
+    # flag: (directory, file kind, column, snapshot, ctx key)
+    "open_interest": ("data/oi", "oi", "open_interest", True, "oi"),
+    "ls_ratio": ("data/lsratio", "lsratio", "buy_ratio", True, "ls_buy"),
+    "premium": ("data/premium", "premium", "close", False, "premium"),
+}
+
+
+def series_flags(config: ExperimentConfig) -> list[str]:
+    return [flag for flag in SERIES_FEATURES if config.section("features").get(flag, False)]
+
+
+def funding_levels(config: ExperimentConfig) -> bool:
+    return config.section("features").get("funding") != "rank_only"
+
+
+def load_symbol_list(config: ExperimentConfig, path: str) -> frozenset[str]:
+    """Read a frozen symbol list: a JSON file with a `symbols` array of base symbols."""
+    return frozenset(json.loads(config.resolve(path).read_text(encoding="utf-8"))["symbols"])
 
 
 def configured_symbol_allowlist(config: ExperimentConfig) -> frozenset[str] | None:
-    if not bool(config.section("data").get("copy_trading_only", False)):
+    data = config.section("data")
+    if data.get("symbol_allowlist"):
+        return load_symbol_list(config, str(data["symbol_allowlist"]))
+    if not bool(data.get("copy_trading_only", False)):
         return None
     return fetch_copy_trading_base_symbols()
+
+
+def portfolio_section(config: ExperimentConfig, ctx: dict[str, Any]) -> dict[str, Any]:
+    """Portfolio settings with the optional trading allowlist resolved to a per-symbol mask."""
+    portfolio = dict(config.section("portfolio"))
+    if portfolio.get("trade_allowlist"):
+        allowed = load_symbol_list(config, str(portfolio["trade_allowlist"]))
+        portfolio["_trade_mask"] = np.array([symbol in allowed for symbol in ctx["symbols"]], dtype=bool)
+    return portfolio
 
 
 def feature_cache_dir(config: ExperimentConfig) -> Path:
@@ -53,23 +102,42 @@ def feature_cache_dir(config: ExperimentConfig) -> Path:
     key = (
         f"{data_fingerprint(config.data_dir, allowed_symbols)}_{FEATURE_VERSION}"
         f"_age{data['min_history_days']}_u{data['feature_universe_max']}"
+        f"{('_fund' if funding_levels(config) else '_fundrank') if uses_funding_features(config) else ''}"
+        f"{''.join('_' + SERIES_FEATURES[flag][1] for flag in series_flags(config))}"
     )
     return config.cache_dir / f"features_{key}"
 
 
-def prediction_cache_file(config: ExperimentConfig, spec: ModelSpec, seed: int) -> Path:
+def prediction_cache_file(config: ExperimentConfig, spec: ModelSpec, seed: int, phase_offset: int = 0) -> Path:
     allowed_symbols = configured_symbol_allowlist(config)
+    # A model depends on its own seed and schedule, not on the other ensemble members.
+    training = {
+        key: value for key, value in config.section("training").items() if key not in {"phase_offsets", "seeds"}
+    }
+    if phase_offset:
+        training["prediction_start"] = str(phase_start(config, phase_offset).date())
     relevant = {
         "backend": config.section("backend"),
         "data": config.section("data"),
-        "training": config.section("training"),
+        "training": training,
         "horizon": spec.horizon,
+        "features": config.section("features"),
+        "model": {
+            **{k: v for k, v in config.section("model").items() if k not in {"horizons", "short_model"}},
+            "horizon": spec.horizon,
+            **({"side": "short"} if spec.side == "short" else {}),
+        },
         "seed": seed,
         "feature_version": FEATURE_VERSION,
         "data_fingerprint": data_fingerprint(config.data_dir, allowed_symbols),
     }
     digest = hashlib.sha256(json.dumps(relevant, sort_keys=True, default=str).encode()).hexdigest()[:16]
     return config.cache_dir / "predictions" / f"{config.backend}_h{spec.horizon}_s{seed}_{digest}.npz"
+
+
+def phase_start(config: ExperimentConfig, phase_offset: int) -> pd.Timestamp:
+    """Walk-forward schedule shifted earlier by `phase_offset` days; every phase covers the same OOS."""
+    return pd.Timestamp(config.section("training")["prediction_start"]) - pd.Timedelta(days=phase_offset)
 
 
 def get_context(config: ExperimentConfig, reuse: bool = True) -> dict[str, Any]:
@@ -82,11 +150,26 @@ def get_context(config: ExperimentConfig, reuse: bool = True) -> dict[str, Any]:
     panel = load_panel(config.data_dir, configured_symbol_allowlist(config))
     data = config.section("data")
     LOG.info("Building features for %d assets x %d days", len(panel["symbols"]), len(panel["dates"]))
+    funding_rate_day = None
+    if uses_funding_features(config):
+        directory = config.resolve((config.section("costs").get("funding") or {}).get("directory", "data/funding"))
+        funding_rate_day = load_funding_factors(directory, panel["dates"], panel["symbols"], panel["open"])["rate_sum"]
+    series = {}
+    for flag in series_flags(config):
+        directory, kind, column, snapshot, key = SERIES_FEATURES[flag]
+        series[key] = load_daily_series(
+            config.resolve(directory), kind, column, panel["dates"], panel["symbols"], snapshot
+        )
     ctx = build_features(
         panel,
+        series=series,
         min_age=int(data["min_history_days"]),
         max_universe=int(data["feature_universe_max"]),
+        funding_rate_day=funding_rate_day,
+        funding_levels=funding_levels(config),
     )
+    if funding_rate_day is not None:
+        ctx["funding_rate_day"] = funding_rate_day.astype(np.float32)
     if cache.exists():
         shutil.rmtree(cache)
     save_context(ctx, cache)
@@ -99,16 +182,30 @@ def train_models(
     ctx: dict[str, Any],
     reuse: bool = True,
 ) -> dict[int, np.ndarray]:
+    if model_spec(config).target == "residual_net_funding":
+        attach_funding(config, ctx)
+    specs = model_specs(config)
+    if len(specs) > 1:
+        outputs: dict[Any, np.ndarray] = {}
+        for spec in specs:
+            for key, scores in _train_spec(config, ctx, spec, reuse).items():
+                outputs[(spec.side, spec.horizon, key) if spec.side == "short" else (spec.horizon, key)] = scores
+        return outputs
+    return _train_spec(config, ctx, specs[0], reuse)
+
+
+def _train_spec(config: ExperimentConfig, ctx: dict[str, Any], spec: ModelSpec, reuse: bool) -> dict[Any, np.ndarray]:
     rows = panel_to_rows(ctx)
     training = config.section("training")
-    prediction_start = pd.Timestamp(training["prediction_start"])
     prediction_end = pd.Timestamp(training.get("prediction_end", ctx["dates"][-1]))
     backend_params = config.section("backend").get("params", {})
-    spec = model_spec(config)
-    outputs: dict[int, np.ndarray] = {}
+    outputs: dict[Any, np.ndarray] = {}
+    offsets = [int(value) for value in training.get("phase_offsets", [0])]
+    runs = [(int(seed), offset) for offset in offsets for seed in training["seeds"]]
 
-    for seed in [int(value) for value in training["seeds"]]:
-        path = prediction_cache_file(config, spec, seed)
+    for seed, offset in runs:
+        prediction_start = phase_start(config, offset)
+        path = prediction_cache_file(config, spec, seed, offset)
         if reuse and path.exists():
             LOG.info("Prediction cache hit: %s", path)
             scores = np.load(path, allow_pickle=False)["scores"]
@@ -127,8 +224,17 @@ def train_models(
             )
             np.savez_compressed(path, scores=scores.astype(np.float32))
             LOG.info("Prediction cache saved: %s", path)
-        outputs[seed] = scores
+        outputs[seed if len(offsets) == 1 else (seed, offset)] = scores
     return outputs
+
+
+def attach_funding(config: ExperimentConfig, ctx: dict[str, Any]) -> None:
+    """Add daily funding-rate sums (known at each close) to the context once."""
+    if "funding_rate_day" in ctx:
+        return
+    directory = config.resolve((config.section("costs").get("funding") or {}).get("directory", "data/funding"))
+    loaded = load_funding_factors(directory, ctx["dates"], list(ctx["symbols"]), np.asarray(ctx["open"]))
+    ctx["funding_rate_day"] = loaded["rate_sum"].astype(np.float32)
 
 
 def build_ensemble_weights(
@@ -136,11 +242,28 @@ def build_ensemble_weights(
     ctx: dict[str, Any],
     predictions: dict[int, np.ndarray],
 ) -> tuple[np.ndarray, dict[int, np.ndarray]]:
+    portfolio_options = config.section("portfolio")
+    if (portfolio_options.get("funding_select") or {}).get("mode", "off") != "off" or portfolio_options.get(
+        "fast_exit"
+    ):
+        attach_funding(config, ctx)
     eligible = np.asarray(ctx["eligible_max"])
+    short_keys = [key for key in predictions if isinstance(key, tuple) and key[0] == "short"]
+    if short_keys:
+        long_ranks = [rank_model_scores(v, eligible) for k, v in predictions.items() if k not in short_keys]
+        short_ranks = [1.0 - rank_model_scores(predictions[k], eligible) for k in short_keys]
+        method = str(config.section("ensemble")["method"])
+        weights = build_weights(
+            ctx,
+            aggregate_seed_ranks(long_ranks, method),
+            portfolio_section(config, ctx),
+            short_scores=aggregate_seed_ranks(short_ranks, method),
+        )
+        return weights.astype(np.float32), dict(enumerate(long_ranks))
     seed_scores = {seed: rank_model_scores(scores, eligible) for seed, scores in predictions.items()}
     ensemble = config.section("ensemble")
     method = str(ensemble["method"])
-    portfolio = config.section("portfolio")
+    portfolio = portfolio_section(config, ctx)
 
     if method == "portfolio_average":
         portfolios = [build_weights(ctx, score, portfolio) for score in seed_scores.values()]
@@ -227,10 +350,52 @@ def _bybit_rule_table(symbols: list[str], rules: dict[str, BybitInstrumentRule])
     return pd.DataFrame(rows)
 
 
+def funding_enabled(config: ExperimentConfig, override: bool | None = None) -> bool:
+    if override is not None:
+        return override
+    return bool((config.section("costs").get("funding") or {}).get("enabled", False))
+
+
+def _funding_summary(
+    executed: Any,
+    funding_factor: np.ndarray,
+    gross_leverage: float,
+    initial_equity: float,
+    dates: pd.DatetimeIndex,
+    start: str,
+    end: str,
+    periods_per_year: int,
+) -> dict[str, Any]:
+    mask = (dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))
+    equity = initial_equity * np.concatenate(([1.0], np.cumprod(1.0 + executed.pnl)[:-1]))
+    held = executed.held_weights.astype(np.float64) * gross_leverage
+    paid = held * np.nan_to_num(funding_factor)
+    long_side = -np.where(held > 0, paid, 0.0).sum(axis=1)
+    short_side = -np.where(held < 0, paid, 0.0).sum(axis=1)
+    gross_notional = np.abs(held).sum(axis=1) * equity
+    funding = executed.funding_pnl[mask]
+    days = max(int(mask.sum()), 1)
+    return {
+        "start": str(pd.Timestamp(start).date()),
+        "end": str(pd.Timestamp(end).date()),
+        "total_return_sum": float(funding.sum()),
+        "annualized": float(funding.mean() * periods_per_year),
+        "long_side_annualized": float(long_side[mask].sum() / days * periods_per_year),
+        "short_side_annualized": float(short_side[mask].sum() / days * periods_per_year),
+        "paying_day_ratio": float((funding < 0).mean()),
+        "worst_day": float(funding.min()),
+        "best_day": float(funding.max()),
+        "uncovered_notional_ratio": float(
+            executed.funding_uncovered_notional[mask].sum() / max(gross_notional[mask].sum(), 1e-12)
+        ),
+    }
+
+
 def backtest(
     config: ExperimentConfig,
     ctx: dict[str, Any],
     predictions: dict[int, np.ndarray],
+    funding: bool | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     evaluation = config.section("evaluation")
     periods_per_year = int(evaluation.get("periods_per_year", 365))
@@ -250,25 +415,49 @@ def backtest(
 
     cost = float(config.section("costs")["one_way_bps"]) / 10_000.0
     execution = config.section("execution")
+    use_funding = funding_enabled(config, funding)
+    funding_factor: np.ndarray | None = None
+    funding_source: dict[str, Any] = {"enabled": use_funding}
+    if use_funding:
+        funding_config = config.section("costs").get("funding") or {}
+        loaded = load_funding_factors(
+            config.resolve(funding_config.get("directory", "data/funding")),
+            dates,
+            list(ctx["symbols"]),
+            np.asarray(ctx["open"]),
+        )
+        funding_factor = loaded.pop("factor")
+        funding_source.update(loaded)
+        LOG.info("Funding loaded: %d files, %d settlements", loaded["files"], loaded["settlements"])
     ideal_pnl, ideal_turnover = simulate_target_weight_pnl(weights, np.asarray(ctx["oo_ret"]), cost)
+    ideal_funding = (
+        target_weight_funding(weights, funding_factor) if funding_factor is not None else np.zeros_like(ideal_pnl)
+    )
+    ideal_pnl = ideal_pnl + ideal_funding
     bybit_rules, bybit_snapshot = fetch_linear_perpetual_rules()
     tradable, qty_step, min_qty, min_notional, max_market_qty = _bybit_rule_arrays(
         list(ctx["symbols"]), bybit_rules
     )
     executable_targets = weights.copy()
     executable_targets[:, ~tradable] = 0.0
-    executed = simulate_bybit_market_pnl(
-        executable_targets,
-        np.asarray(ctx["open"]),
-        np.asarray(ctx["oo_ret"]),
-        cost,
-        initial_equity_usd=float(execution["initial_equity_usd"]),
-        gross_leverage=float(execution["gross_leverage"]),
-        qty_step=qty_step,
-        min_order_qty=min_qty,
-        min_notional_value=min_notional,
-        max_market_order_qty=max_market_qty,
-    )
+
+    def execute(one_way_cost: float, factor: np.ndarray | None) -> Any:
+        return simulate_bybit_market_pnl(
+            executable_targets,
+            np.asarray(ctx["open"]),
+            np.asarray(ctx["oo_ret"]),
+            one_way_cost,
+            initial_equity_usd=float(execution["initial_equity_usd"]),
+            gross_leverage=float(execution["gross_leverage"]),
+            qty_step=qty_step,
+            min_order_qty=min_qty,
+            min_notional_value=min_notional,
+            max_market_order_qty=max_market_qty,
+            funding_factor=factor,
+        )
+
+    executed = execute(cost, funding_factor)
+    without_funding = execute(cost, None) if funding_factor is not None else executed
     pnl, turnover = executed.pnl, executed.turnover
     effective_end = str(dates[end_idx].date())
     full_metrics, full_monthly = metrics(pnl, turnover, dates, oos_start, effective_end, periods_per_year)
@@ -294,7 +483,24 @@ def backtest(
             "tradable_symbols": int(tradable.sum()),
             "unavailable_symbols": int((~tradable).sum()),
         },
+        "funding": funding_source,
     }
+    if funding_factor is not None:
+        for label, start in (("full", oos_start), ("latest_year", latest_start)):
+            summary["funding"][label] = _funding_summary(
+                executed,
+                funding_factor,
+                float(execution["gross_leverage"]),
+                float(execution["initial_equity_usd"]),
+                dates,
+                start,
+                effective_end,
+                periods_per_year,
+            )
+        summary["without_funding"] = {
+            label: metrics(without_funding.pnl, without_funding.turnover, dates, start, effective_end, periods_per_year)[0]
+            for label, start in (("full", oos_start), ("latest_year", latest_start))
+        }
 
     output = _run_directory(config)
     (output / "config_resolved.yaml").write_text(yaml.safe_dump(config.raw, sort_keys=False), encoding="utf-8")
@@ -326,7 +532,10 @@ def backtest(
             "gross_exposure": np.abs(dated_weights).sum(axis=1),
             "net_exposure": dated_weights.sum(axis=1),
             "beta_exposure": beta_exposure,
+            "funding_return": executed.funding_pnl[mask],
+            "net_return_without_funding": without_funding.pnl[mask],
             "ideal_net_return": ideal_pnl[mask],
+            "ideal_funding_return": ideal_funding[mask],
             "ideal_turnover": ideal_turnover[mask],
             "rejected_notional_usd": executed.rejected_notional[mask],
             "attempted_orders": executed.attempted_orders[mask],
@@ -346,18 +555,7 @@ def backtest(
 
     fee_rows: list[dict[str, Any]] = []
     for bps in evaluation.get("fee_stress_bps", [5, 10, 15, 20, 30]):
-        fee_execution = simulate_bybit_market_pnl(
-            executable_targets,
-            np.asarray(ctx["open"]),
-            np.asarray(ctx["oo_ret"]),
-            float(bps) / 10_000.0,
-            initial_equity_usd=float(execution["initial_equity_usd"]),
-            gross_leverage=float(execution["gross_leverage"]),
-            qty_step=qty_step,
-            min_order_qty=min_qty,
-            min_notional_value=min_notional,
-            max_market_order_qty=max_market_qty,
-        )
+        fee_execution = execute(float(bps) / 10_000.0, funding_factor)
         for label, start in (("full", oos_start), ("latest_year", latest_start)):
             row, _ = metrics(fee_execution.pnl, fee_execution.turnover, dates, start, effective_end, periods_per_year)
             fee_rows.append({"one_way_bps": bps, "period": label, **row})
@@ -437,10 +635,11 @@ def run(
     config: ExperimentConfig,
     reuse_features: bool = True,
     reuse_predictions: bool = True,
+    funding: bool | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     started = time.perf_counter()
     ctx = get_context(config, reuse=reuse_features)
     predictions = train_models(config, ctx, reuse=reuse_predictions)
-    output, summary = backtest(config, ctx, predictions)
+    output, summary = backtest(config, ctx, predictions, funding=funding)
     LOG.info("Total elapsed: %.1fs", time.perf_counter() - started)
     return output, summary

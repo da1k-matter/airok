@@ -22,15 +22,47 @@ confirmed days, ending at yesterday UTC by default:
 python src/update_data.py --data-dir data/1d
 ```
 
-`configs/lightgbm_h7.yaml` is the production candidate: a five-seed LightGBM LambdaRank ensemble with median-rank aggregation.
+To rebuild the panel from scratch (and optionally funding history), use the
+Bybit scraper. It keeps only confirmed bars through `--through` (default
+yesterday UTC), fetches every symbol's request windows concurrently under one
+adaptive rate limiter, and shows progress bars per phase:
 
-`configs/lightgbm_h7_copytrading.yaml` runs the same recipe on the current
-Bybit Copy Trading universe. At process start it requests Bybit linear
-instrument metadata and retains only `Trading` USDT `LinearPerpetual`
-contracts whose `copyTrading` value is `both`. The exact data-file universe is
-saved as `training_universe.json` in the run output alongside the complete API
-rule snapshot. Run it with the same command, substituting the copy-trading
-config path.
+```bash
+python src/scraper_bybit.py --data-dir data/1d --days 1000 --symbols-from data/1d --funding
+```
+
+Without `--symbols`/`--symbols-from` it downloads every trading USDT perpetual.
+`--funding` also writes `data/funding/<SYMBOL>_funding.csv` (`timestamp`,
+`funding_rate`; one row per settlement, positive means longs pay shorts);
+`--funding-only` skips candles. Each output directory receives a
+`_manifest_*.json` with per-symbol coverage.
+
+### Funding in backtests
+
+With `costs.funding.enabled: true` the backtest charges Bybit funding exactly
+as the exchange settles it: at each settlement the open position pays
+`qty × price × funding_rate` (positive rates are paid by longs and received by
+shorts). A position executed at open t is held through open t+1, so it pays
+every settlement in (00:00 t, 00:00 t+1]; the 00:00 settlement on a rebalance
+day is charged to the position held before the rebalance. The intraday mark
+price is interpolated between the two opens. `--funding` / `--no-funding`
+overrides the YAML for `run` and `backtest`.
+
+When funding is charged, the headline metrics include it; `summary.json`
+additionally holds `without_funding` metrics from the same predictions and a
+`funding` attribution block (annualized total, long and short sides, coverage).
+`daily.csv` gains `funding_return` and `net_return_without_funding`.
+
+`configs/lightgbm_h7.yaml` is the original five-seed LightGBM LambdaRank ensemble with median-rank aggregation.
+
+`configs/lightgbm_h7_champion.yaml` is the live recipe (research champion
+`v2_base_neutral`): the same model with 10 seeds plus 0.5 alt-index and size
+neutralization in the portfolio. Export the live bundle with
+`python src/export_bundle.py --config configs/lightgbm_h7_champion.yaml --bundle ../live/models/<name>`.
+Models are trained on the full universe; to trade only Copy Trading contracts,
+enable `bybit.copy_trading_only` in the live service instead of training on
+that subset. Research variants and their logs live in the untracked `research/`
+directory.
 
 ## Local artifacts
 
