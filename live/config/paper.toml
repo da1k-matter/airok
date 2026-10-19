@@ -18,7 +18,7 @@ fee_bps = 10.0
 reject_partial_fills = true
 
 [server]
-bind = "127.0.0.1:8789"
+bind = "127.0.0.1:18789"
 
 [storage]
 ledger_path = "state/paper/airok-paper.sqlite3"

@@ -55,6 +55,6 @@ cd live
 cargo run --release -p airok-paper -- --config config/paper.toml
 ```
 
-The dashboard is available at `http://127.0.0.1:8789`. The service uses public Bybit endpoints only and does not have private credentials or order-placement code.
+The dashboard is available at `http://127.0.0.1:18789` (public Nginx port `8790` in production). The service uses public Bybit endpoints only and does not have private credentials or order-placement code.
 
 See [`train/README.md`](train/README.md) for the research contract and [`live/README.md`](live/README.md) for live-runtime behavior.

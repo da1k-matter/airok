@@ -24,7 +24,7 @@ From `live/`:
 cargo run --release -p airok-paper -- --config config/paper.toml
 ```
 
-Open `http://127.0.0.1:8789`. Readiness is confirmed by `GET /health` and the detailed session state at `GET /api/session`.
+Open `http://127.0.0.1:18789`. Readiness is confirmed by `GET /health` and the detailed session state at `GET /api/session`. In production, Nginx proxies public port `8790` to this loopback address.
 
 The default runtime configuration reads the shared historical candle directory at `../train/data/1d` for bootstrap only. It writes no research artifacts there. Change `[data].directory` if the deployed service maintains its own market-history store.
 
@@ -114,7 +114,7 @@ python src/cli.py run --config configs/lightgbm_h7_champion.yaml --no-funding
 
 The replay compares target-weight returns, so convert the run's `ideal_net_return` and
 `ideal_turnover` columns into `date,net_return,turnover` (`ideal_reference.csv`). Then run this
-from `live/` and open `http://127.0.0.1:8789`:
+from `live/` and open `http://127.0.0.1:18789`:
 
 ```bash
 cargo run --release -p airok-paper -- --config config/paper.toml \
