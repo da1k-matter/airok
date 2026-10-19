@@ -22,10 +22,10 @@ use rt_ledger::{
 use rt_model::{BundleMetadata, LightGbmLibrary, NativeBooster, inspect_bundle};
 use rt_panel::{
     FeaturePanel, MarketPanel, alt_index_beta, build_features, load_daily_csv_panel,
-    merge_confirmed_daily_candles, size_exposure,
+    merge_confirmed_daily_candles,
 };
 use rt_strategy::{
-    FactorExposures, OverlayRules, PortfolioRules, apply_volatility_overlay, build_daily_weights,
+    OverlayRules, PortfolioRules, apply_volatility_overlay, build_daily_weights,
     median_rank_ensemble, smooth_fixed_window,
 };
 use serde::{Deserialize, Serialize};
@@ -59,20 +59,18 @@ struct RuntimeConfig {
     strategy: StrategyConfig,
 }
 
-/// Portfolio factor neutralization; the defaults are the research champion (`v2_base_neutral`).
+/// Portfolio factor neutralization; the default is the research champion (`v2_alt_only`).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StrategyConfig {
     #[serde(default = "default_alt_beta_neutral")]
     alt_beta_neutral: f64,
-    #[serde(default = "default_size_neutral")]
-    size_neutral: bool,
 }
 
 impl Default for StrategyConfig {
     fn default() -> Self {
         Self {
             alt_beta_neutral: default_alt_beta_neutral(),
-            size_neutral: default_size_neutral(),
         }
     }
 }
@@ -81,15 +79,10 @@ fn default_alt_beta_neutral() -> f64 {
     PortfolioRules::default().alt_beta_neutral
 }
 
-fn default_size_neutral() -> bool {
-    PortfolioRules::default().size_neutral
-}
-
 impl StrategyConfig {
     fn portfolio_rules(&self) -> PortfolioRules {
         PortfolioRules {
             alt_beta_neutral: self.alt_beta_neutral,
-            size_neutral: self.size_neutral,
             ..PortfolioRules::default()
         }
     }
@@ -1907,22 +1900,17 @@ impl NativeScorer {
                 .map(|value| f64::from(*value))
                 .collect::<Vec<_>>()
         };
-        let size = panel.alt_beta.as_ref().map(|_| size_exposure(panel, row));
-        let exposures = panel
+        let alt_beta = panel
             .alt_beta
             .as_ref()
-            .zip(size.as_ref())
-            .map(|(alt_beta, size)| FactorExposures {
-                alt_beta: &alt_beta[row * width..(row + 1) * width],
-                size,
-            });
+            .map(|alt_beta| &alt_beta[row * width..(row + 1) * width]);
         build_daily_weights(
             &scores,
             &eligible,
             &to_f64(panel.liquidity_rank.row(row)),
             &to_f64(panel.beta60.row(row)),
             &to_f64(panel.vol20.row(row)),
-            exposures,
+            alt_beta,
             trade_mask,
             &self.rules,
         )

@@ -71,8 +71,6 @@ portfolio:
     low_vol_multiplier: 1.1
     high_vol_multiplier: 0.75
   alt_beta_neutral: 0.5
-  neutral_characteristics:
-  - size
 costs:
   one_way_bps: 10.0
   funding:

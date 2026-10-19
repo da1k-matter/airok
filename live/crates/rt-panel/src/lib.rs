@@ -657,18 +657,6 @@ pub fn alt_index_beta(panel: &FeaturePanel, window: usize) -> Vec<f64> {
     beta
 }
 
-/// Cross-sectional z-score of 20-day log dollar volume over the eligible universe at `row`.
-pub fn size_exposure(panel: &FeaturePanel, row: usize) -> Vec<f64> {
-    let cols = panel.dvol20.cols;
-    let values = panel
-        .dvol20
-        .row(row)
-        .iter()
-        .map(|value| f64::from(*value))
-        .collect::<Vec<_>>();
-    rt_strategy::cross_sectional_z(&values, &panel.eligible_max[row * cols..(row + 1) * cols])
-}
-
 #[derive(Debug, serde::Deserialize)]
 struct CsvRow {
     timestamp: String,

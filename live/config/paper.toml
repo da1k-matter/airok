@@ -5,10 +5,9 @@ bundle = "models/lightgbm_h7_champion_20261013"
 directory = "../train/data/1d"
 
 [strategy]
-# Research champion v2_base_neutral: blend the BTC-neutral book 50/50 with a book that is also
-# neutral to the equal-weighted alt index and to size (20-day dollar-volume z-score).
+# Research champion v2_alt_only: blend the BTC-neutral book 50/50 with a book that is also
+# neutral to the 60-day beta against the equal-weighted alt index.
 alt_beta_neutral = 0.5
-size_neutral = true
 
 [paper]
 initial_equity_usd = 1000.0

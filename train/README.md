@@ -56,8 +56,8 @@ additionally holds `without_funding` metrics from the same predictions and a
 `configs/lightgbm_h7.yaml` is the original five-seed LightGBM LambdaRank ensemble with median-rank aggregation.
 
 `configs/lightgbm_h7_champion.yaml` is the live recipe (research champion
-`v2_base_neutral`): the same model with 10 seeds plus 0.5 alt-index and size
-neutralization in the portfolio. Export the live bundle with
+`v2_alt_only`): the same model with 10 seeds plus 0.5 alt-index neutralization in
+the portfolio. Export the live bundle with
 `python src/export_bundle.py --config configs/lightgbm_h7_champion.yaml --bundle ../live/models/<name>`.
 Models are trained on the full universe; to trade only Copy Trading contracts,
 enable `bybit.copy_trading_only` in the live service instead of training on
