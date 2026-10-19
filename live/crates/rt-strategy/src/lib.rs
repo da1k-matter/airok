@@ -13,19 +13,9 @@ pub struct PortfolioRules {
     pub dollar_neutral: bool,
     pub btc_beta_neutral: bool,
     pub smoothing_days: usize,
-    /// Blend weight of the book that is also neutral to the alt index (and size); 0 disables it.
+    /// Blend weight of the book that is also neutral to the alt index; 0 disables it.
     #[serde(default)]
     pub alt_beta_neutral: f64,
-    /// Also neutralize the cross-sectional size z-score inside the alt-neutral book.
-    #[serde(default)]
-    pub size_neutral: bool,
-}
-
-/// Per-asset exposures, known at the decision close, for the alt-neutral book.
-#[derive(Debug, Clone, Copy)]
-pub struct FactorExposures<'a> {
-    pub alt_beta: &'a [f64],
-    pub size: &'a [f64],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -60,7 +50,6 @@ impl Default for PortfolioRules {
             btc_beta_neutral: true,
             smoothing_days: 21,
             alt_beta_neutral: 0.5,
-            size_neutral: true,
         }
     }
 }
@@ -203,34 +192,6 @@ pub fn median_rank_ensemble(
     Ok(result)
 }
 
-/// Cross-sectional z-score over eligible finite values (population std); missing results are zero.
-pub fn cross_sectional_z(values: &[f64], eligible: &[bool]) -> Vec<f64> {
-    let members = values
-        .iter()
-        .zip(eligible)
-        .filter(|(value, eligible)| **eligible && value.is_finite())
-        .map(|(value, _)| *value)
-        .collect::<Vec<_>>();
-    if members.is_empty() {
-        return vec![0.0; values.len()];
-    }
-    let mean = members.iter().sum::<f64>() / members.len() as f64;
-    let std = (members
-        .iter()
-        .map(|value| (value - mean).powi(2))
-        .sum::<f64>()
-        / members.len() as f64)
-        .sqrt();
-    let scale = if std > 1e-12 { std } else { 1.0 };
-    values
-        .iter()
-        .map(|value| {
-            let z = (value - mean) / scale;
-            if z.is_finite() { z } else { 0.0 }
-        })
-        .collect()
-}
-
 /// Build one decision's raw long/short weights.
 ///
 /// `trade_mask` restricts the tradable names (e.g. Copy Trading); the liquidity-ranked
@@ -241,7 +202,7 @@ pub fn build_daily_weights(
     liquidity_rank: &[f64],
     beta: &[f64],
     volatility: &[f64],
-    exposures: Option<FactorExposures<'_>>,
+    alt_beta: Option<&[f64]>,
     trade_mask: Option<&[bool]>,
     rules: &PortfolioRules,
 ) -> Result<Vec<f64>, StrategyError> {
@@ -252,8 +213,8 @@ pub fn build_daily_weights(
         beta.len(),
         volatility.len(),
     ];
-    if let Some(exposures) = exposures {
-        lengths.extend([exposures.alt_beta.len(), exposures.size.len()]);
+    if let Some(alt_beta) = alt_beta {
+        lengths.push(alt_beta.len());
     }
     if let Some(mask) = trade_mask {
         lengths.push(mask.len());
@@ -271,9 +232,9 @@ pub fn build_daily_weights(
             "alt_beta_neutral must be within [0, 1]".to_owned(),
         ));
     }
-    let alt_exposures = if rules.alt_beta_neutral > 0.0 {
-        Some(exposures.ok_or_else(|| {
-            StrategyError::InvalidRule("alt-index neutralization needs factor exposures".to_owned())
+    let alt_beta = if rules.alt_beta_neutral > 0.0 {
+        Some(alt_beta.ok_or_else(|| {
+            StrategyError::InvalidRule("alt-index neutralization needs alt-index betas".to_owned())
         })?)
     } else {
         None
@@ -322,12 +283,8 @@ pub fn build_daily_weights(
     if rules.dollar_neutral || rules.btc_beta_neutral {
         let raw = weights.clone();
         project_dollar_and_beta(&mut weights, beta);
-        if let Some(exposures) = alt_exposures {
-            let mut factors = vec![exposures.alt_beta];
-            if rules.size_neutral {
-                factors.push(exposures.size);
-            }
-            let full = project_onto_complement(&raw, beta, &factors);
+        if let Some(alt_beta) = alt_beta {
+            let full = project_onto_complement(&raw, beta, &[alt_beta]);
             let strength = rules.alt_beta_neutral;
             for (weight, neutral) in weights.iter_mut().zip(full) {
                 *weight = (1.0 - strength) * *weight + strength * neutral;
@@ -592,12 +549,11 @@ fn project_dollar_and_beta(weights: &mut [f64], beta: &[f64]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        FactorExposures, OverlayRules, PortfolioRules, airok_feature_names,
-        apply_volatility_overlay, build_daily_weights, cross_section_rank_percentile,
-        cross_sectional_z, median_rank_ensemble,
+        OverlayRules, PortfolioRules, airok_feature_names, apply_volatility_overlay,
+        build_daily_weights, cross_section_rank_percentile, median_rank_ensemble,
     };
 
-    fn sample(count: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+    fn sample(count: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let scores = (0..count)
             .map(|value| ((value * 7) % count) as f64)
             .collect();
@@ -605,25 +561,19 @@ mod tests {
         let alt = (0..count)
             .map(|value| 1.0 + ((value * 3) % 5) as f64 / 4.0)
             .collect();
-        let size = (0..count)
-            .map(|value| (value as f64 - 10.0) / 6.0)
-            .collect();
-        (scores, beta, alt, size)
+        (scores, beta, alt)
     }
 
     #[test]
-    fn full_alt_neutral_book_has_no_alt_or_size_exposure() {
-        let (scores, beta, alt, size) = sample(24);
+    fn full_alt_neutral_book_has_no_alt_exposure() {
+        let (scores, beta, alt) = sample(24);
         let weights = build_daily_weights(
             &scores,
             &[true; 24],
             &[1.0; 24],
             &beta,
             &[0.02; 24],
-            Some(FactorExposures {
-                alt_beta: &alt,
-                size: &size,
-            }),
+            Some(&alt),
             None,
             &PortfolioRules {
                 tail_count: 4,
@@ -643,13 +593,12 @@ mod tests {
         assert!(weights.iter().sum::<f64>().abs() < 1e-5);
         assert!(exposure(&beta) < 1e-5);
         assert!(exposure(&alt) < 1e-5);
-        assert!(exposure(&size) < 1e-5);
         assert!((weights.iter().map(|value| value.abs()).sum::<f64>() - 1.0).abs() < 1e-12);
     }
 
     #[test]
     fn partial_neutralization_blends_both_books_at_unit_gross() {
-        let (scores, beta, alt, size) = sample(24);
+        let (scores, beta, alt) = sample(24);
         let build = |strength: f64| {
             build_daily_weights(
                 &scores,
@@ -657,10 +606,7 @@ mod tests {
                 &[1.0; 24],
                 &beta,
                 &[0.02; 24],
-                Some(FactorExposures {
-                    alt_beta: &alt,
-                    size: &size,
-                }),
+                Some(&alt),
                 None,
                 &PortfolioRules {
                     tail_count: 4,
@@ -714,15 +660,6 @@ mod tests {
             .filter(|index| weights[*index] != 0.0)
             .collect::<Vec<_>>();
         assert_eq!(held, vec![0, 2, 16, 18]);
-    }
-
-    #[test]
-    fn z_score_uses_eligible_names_and_zeroes_missing_values() {
-        let z = cross_sectional_z(&[1.0, 3.0, 100.0, f64::NAN], &[true, true, false, true]);
-        assert_eq!(z[0], -1.0);
-        assert_eq!(z[1], 1.0);
-        assert_eq!(z[2], 98.0);
-        assert_eq!(z[3], 0.0);
     }
 
     #[test]

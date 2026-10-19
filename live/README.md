@@ -31,13 +31,17 @@ The default runtime configuration reads the shared historical candle directory a
 ### Strategy
 
 The default bundle `models/lightgbm_h7_champion_20261013` is the research champion
-`v2_base_neutral` (`train/configs/lightgbm_h7_champion.yaml`): the same LightGBM h7 recipe with
-10 seeds, plus portfolio neutralization configured in `[strategy]`:
+`v2_alt_only` (`train/configs/lightgbm_h7_champion.yaml`): the same LightGBM h7 recipe with
+10 seeds, plus one portfolio rule configured in `[strategy]`:
 
 - `alt_beta_neutral = 0.5` blends the dollar/BTC-beta neutral book 50/50 with a book that is
-  also neutral to the 60-day beta against the equal-weighted eligible-universe return;
-- `size_neutral = true` additionally neutralizes the cross-sectional z-score of 20-day log
-  dollar volume in that second book.
+  also neutral to the 60-day beta against the equal-weighted eligible-universe return.
+
+The rule targets a measured risk: the plain book has a -0.17 daily beta to the alt index
+(t = -11.7 on 2023-08..2026-06). The blend cuts that exposure and lowers volatility from 17% to
+15% a year (block bootstrap P < 0.001 on both seed sets and both trading tracks) without a
+significant change in mean return. Size neutralization was tested the same way, failed, and
+was removed.
 
 Seed ranks are aggregated with float32 rounding exactly as numpy does, so that equal ranks tie
 and are ordered by column like numpy's stable sort.
